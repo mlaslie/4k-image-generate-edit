@@ -1,0 +1,519 @@
+import io
+import os
+import time
+import json
+import base64
+import asyncio
+import logging
+from typing import Optional, Tuple, Any, Dict
+from PIL import Image, PngImagePlugin
+from google import genai
+from google.genai import types
+from google.adk.tools import ToolContext
+
+logger = logging.getLogger(__name__)
+
+# Primary model requested
+MODEL_NAME = "gemini-3-pro-image"
+
+# Target 4K dimensions
+RESOLUTION_MAP = {
+    "1:1": (4096, 4096),
+    "16:9": (3840, 2160),
+    "9:16": (2160, 3840),
+    "4:3": (3840, 2880),
+    "3:4": (2880, 3840),
+}
+
+# --- Client & Logger Singletons ---
+_gcp_logging_client: Optional[Any] = None
+_gcp_audit_logger: Optional[Any] = None
+_genai_client: Optional[genai.Client] = None
+_logging_init_attempted: bool = False
+
+
+def get_logging_client():
+    """Initializes and caches a singleton Google Cloud Logging client & logger."""
+    global _gcp_logging_client, _gcp_audit_logger, _logging_init_attempted
+    if _logging_init_attempted:
+        return _gcp_logging_client, _gcp_audit_logger
+
+    _logging_init_attempted = True
+    use_enterprise = (
+        os.environ.get("GOOGLE_GENAI_USE_ENTERPRISE", "1") == "1"
+        or os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "1") == "1"
+    )
+    if not use_enterprise:
+        return None, None
+
+    try:
+        project = os.environ.get("GOOGLE_CLOUD_PROJECT", "laslie-demo-project")
+        import google.cloud.logging
+        from google.cloud.logging_v2.resource import Resource
+
+        _gcp_logging_client = google.cloud.logging.Client(project=project)
+        _gcp_audit_logger = _gcp_logging_client.logger("image_agent_user_audit")
+    except Exception as e:
+        logger.debug("Cloud Logging initialization bypassed: %s", e)
+    return _gcp_logging_client, _gcp_audit_logger
+
+
+def get_genai_client() -> genai.Client:
+    """Initializes and caches a singleton Google GenAI client configured for ADC / Vertex AI."""
+    global _genai_client
+    if _genai_client is None:
+        api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+        project = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCP_PROJECT", "laslie-demo-project")
+        location = os.environ.get("GOOGLE_CLOUD_LOCATION", "global")
+        use_enterprise = (
+            os.environ.get("GOOGLE_GENAI_USE_ENTERPRISE", "1") == "1"
+            or os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "1") == "1"
+        )
+
+        if api_key:
+            _genai_client = genai.Client(api_key=api_key)
+        elif use_enterprise and project:
+            _genai_client = genai.Client(vertexai=True, project=project, location=location)
+        else:
+            _genai_client = genai.Client()
+    return _genai_client
+
+
+def get_user_identity(tool_context: Optional[ToolContext] = None) -> str:
+    """
+    Extracts the user identity (email / ID) from Gemini Enterprise OIDC tokens,
+    session state, tool_context.user_id, or metadata.
+    Returns 'unknown' if not resolvable without failing.
+    """
+    if not tool_context:
+        return "unknown"
+
+    try:
+        # 1. Check OIDC auth response / token claims if available
+        if hasattr(tool_context, "get_auth_response"):
+            try:
+                auth_resp = tool_context.get_auth_response()
+                if auth_resp and isinstance(auth_resp, dict):
+                    for key in ["email", "user_email", "preferred_username", "sub"]:
+                        val = auth_resp.get(key)
+                        if val and isinstance(val, str) and val.strip():
+                            return val.strip()
+            except Exception:
+                pass
+
+        # 2. Check session state or invocation state for OIDC / user claims
+        state = getattr(tool_context, "state", {}) or {}
+        if isinstance(state, dict):
+            for key in ["user_email", "email", "user_id", "user", "preferred_username"]:
+                val = state.get(key)
+                if val and isinstance(val, str) and val.strip():
+                    return val.strip()
+
+        # 3. Direct tool_context.user_id property
+        user_id = getattr(tool_context, "user_id", None)
+        if user_id and isinstance(user_id, str) and user_id.strip():
+            return user_id.strip()
+
+        # 4. Check session.user_id
+        if hasattr(tool_context, "session") and tool_context.session:
+            session_user_id = getattr(tool_context.session, "user_id", None)
+            if session_user_id and isinstance(session_user_id, str) and session_user_id.strip():
+                return session_user_id.strip()
+
+        # 5. Check custom_metadata
+        if hasattr(tool_context, "custom_metadata") and tool_context.custom_metadata:
+            for key in ["user_email", "email", "user_id", "user", "principal"]:
+                val = tool_context.custom_metadata.get(key)
+                if val and isinstance(val, str) and val.strip():
+                    return val.strip()
+    except Exception:
+        pass
+
+    return "unknown"
+
+
+def _write_cloud_log_struct(log_payload: Dict[str, Any]):
+    """Helper to write log entry with ReasoningEngine resource attachment in worker thread."""
+    try:
+        _, gcp_logger = get_logging_client()
+        if gcp_logger:
+            from google.cloud.logging_v2.resource import Resource
+
+            engine_id = os.environ.get("REASONING_ENGINE_ID", "1371774346313334784")
+            location = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
+            project = os.environ.get("GOOGLE_CLOUD_PROJECT", "laslie-demo-project")
+
+            resource = Resource(
+                type="aiplatform.googleapis.com/ReasoningEngine",
+                labels={
+                    "reasoning_engine_id": engine_id,
+                    "location": location,
+                    "resource_container": f"projects/{project}",
+                },
+            )
+            gcp_logger.log_struct(log_payload, resource=resource, severity="INFO")
+    except Exception as e:
+        logger.debug("Cloud Logging struct write exception: %s", e)
+
+
+def log_user_activity(action: str, user_id: str, details: Dict[str, Any]):
+    """
+    Logs user activity to standard logging and Google Cloud Logging via singleton and ReasoningEngine resource.
+    Guaranteed never to raise exceptions or interrupt tool execution.
+    """
+    try:
+        safe_user_id = user_id if (user_id and isinstance(user_id, str) and user_id.strip()) else "unknown"
+        log_payload = {
+            "event": "image_agent_user_activity",
+            "action": action,
+            "user_id": safe_user_id,
+            "timestamp": time.time(),
+            **details,
+        }
+
+        logger.info(
+            "User [%s] performed action '%s' - Details: %s",
+            safe_user_id,
+            action,
+            json.dumps(log_payload, default=str),
+        )
+
+        # Offload cloud logging write to thread pool if in active event loop
+        try:
+            loop = asyncio.get_running_loop()
+            loop.run_in_executor(None, _write_cloud_log_struct, log_payload)
+        except RuntimeError:
+            _write_cloud_log_struct(log_payload)
+    except Exception as e:
+        logger.debug("log_user_activity outer handler exception: %s", e)
+
+
+def calculate_dpi_for_resolution(width: int, height: int) -> Tuple[int, int]:
+    """
+    Determines optimal DPI metadata based on image resolution.
+    - 4K / Ultra-HD (>= 3840px): 300 DPI (High-quality print standard)
+    - 2K / Quad-HD (>= 2048px): 240 DPI
+    - 1K / Full-HD (>= 1024px): 150 DPI
+    - Standard Web (< 1024px): 72 DPI
+    """
+    max_dimension = max(width, height)
+    if max_dimension >= 3840:
+        return (300, 300)
+    elif max_dimension >= 2048:
+        return (240, 240)
+    elif max_dimension >= 1024:
+        return (150, 150)
+    else:
+        return (72, 72)
+
+
+def _sync_process_and_apply_4k_dpi(
+    image_bytes: bytes,
+    aspect_ratio: str = "1:1",
+) -> Tuple[bytes, str, Tuple[int, int], Tuple[int, int]]:
+    """Synchronous CPU worker for image resizing and DPI injection."""
+    img = Image.open(io.BytesIO(image_bytes))
+
+    target_dim = RESOLUTION_MAP.get(aspect_ratio, (4096, 4096))
+    if img.width < target_dim[0] or img.height < target_dim[1]:
+        img = img.resize(target_dim, Image.Resampling.LANCZOS)
+
+    width, height = img.size
+    dpi = calculate_dpi_for_resolution(width, height)
+
+    mime_type = "image/png"
+    output_buf = io.BytesIO()
+    png_info = PngImagePlugin.PngInfo()
+    png_info.add_text("Resolution", f"{width}x{height}")
+    png_info.add_text("DPI", f"{dpi[0]}")
+    img.save(output_buf, format="PNG", dpi=dpi, pnginfo=png_info)
+
+    return output_buf.getvalue(), mime_type, (width, height), dpi
+
+
+async def process_and_apply_4k_dpi(
+    image_bytes: bytes,
+    aspect_ratio: str = "1:1",
+) -> Tuple[bytes, str, Tuple[int, int], Tuple[int, int]]:
+    """
+    Asynchronously processes image to 4K resolution and injects DPI metadata in a worker thread.
+    Prevents blocking the async event loop.
+    """
+    return await asyncio.to_thread(_sync_process_and_apply_4k_dpi, image_bytes, aspect_ratio)
+
+
+def _extract_image_bytes(response: Any) -> Optional[bytes]:
+    """Helper to extract raw image bytes from a GenerateContent response."""
+    if hasattr(response, "candidates") and response.candidates:
+        for cand in response.candidates:
+            if cand.content and cand.content.parts:
+                for part in cand.content.parts:
+                    if part.inline_data and part.inline_data.data:
+                        return part.inline_data.data
+    return None
+
+
+async def _execute_gemini_3_pro_image(
+    prompt: str,
+    input_image_bytes: Optional[bytes] = None,
+    input_mime_type: str = "image/png",
+    aspect_ratio: str = "1:1",
+    max_retries: int = 3,
+) -> bytes:
+    """
+    Executes gemini-3-pro-image on Vertex AI / Google AI with ADC and exponential retry.
+    """
+    client = get_genai_client()
+    contents = []
+    if input_image_bytes:
+        contents.append(types.Part.from_bytes(data=input_image_bytes, mime_type=input_mime_type))
+    contents.append(f"{prompt}, rendered in 4K resolution, aspect ratio {aspect_ratio}")
+
+    config = types.GenerateContentConfig(
+        response_modalities=["IMAGE", "TEXT"],
+    )
+
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            response = await client.aio.models.generate_content(
+                model=MODEL_NAME,
+                contents=contents,
+                config=config,
+            )
+            raw_bytes = _extract_image_bytes(response)
+            if raw_bytes:
+                return raw_bytes
+        except Exception as e:
+            last_err = e
+            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+                wait_time = (attempt + 1) * 3
+                logger.warning("Rate limit 429 hit. Retrying in %ss...", wait_time)
+                await asyncio.sleep(wait_time)
+            else:
+                raise
+
+    raise last_err if last_err else RuntimeError(f"No image was returned by {MODEL_NAME}.")
+
+
+async def generate_4k_image(
+    prompt: str,
+    aspect_ratio: str = "1:1",
+    negative_prompt: str = "",
+    tool_context: Optional[ToolContext] = None,
+) -> str:
+    """
+    Generates a high-quality 4K resolution image using the gemini-3-pro-image model
+    and embeds DPI metadata based on the output resolution.
+
+    Args:
+        prompt: Detailed description of the image to generate.
+        aspect_ratio: Aspect ratio of the output image ('1:1', '16:9', '9:16', '4:3', '3:4'). Default is '1:1'.
+        negative_prompt: Optional elements to exclude from the generated image.
+        tool_context: ADK ToolContext for artifact storage and session management.
+
+    Returns:
+        A message detailing the generated image, resolution, DPI metadata, and artifact filename.
+    """
+    user_id = get_user_identity(tool_context)
+    log_user_activity(
+        action="generate_4k_image_request",
+        user_id=user_id,
+        details={"prompt": prompt, "aspect_ratio": aspect_ratio, "negative_prompt": negative_prompt},
+    )
+
+    try:
+        full_prompt = f"{prompt} (Exclude: {negative_prompt})" if negative_prompt else prompt
+        raw_bytes = await _execute_gemini_3_pro_image(
+            prompt=full_prompt,
+            aspect_ratio=aspect_ratio,
+        )
+
+        # Process to 4K and inject DPI metadata asynchronously in worker thread
+        processed_bytes, mime_type, (width, height), (dpi_x, dpi_y) = await process_and_apply_4k_dpi(
+            raw_bytes, aspect_ratio=aspect_ratio
+        )
+
+        timestamp = int(time.time())
+        filename = f"generated_4k_{timestamp}.png"
+
+        if tool_context:
+            artifact_part = types.Part.from_bytes(data=processed_bytes, mime_type=mime_type)
+            metadata = {
+                "model": MODEL_NAME,
+                "resolution": f"{width}x{height}",
+                "dpi": f"{dpi_x}x{dpi_y}",
+                "aspect_ratio": aspect_ratio,
+                "prompt": prompt,
+                "user_id": user_id,
+            }
+            await tool_context.save_artifact(filename=filename, artifact=artifact_part, custom_metadata=metadata)
+
+        log_user_activity(
+            action="generate_4k_image_success",
+            user_id=user_id,
+            details={
+                "prompt": prompt,
+                "artifact_filename": filename,
+                "resolution": f"{width}x{height}",
+                "dpi": f"{dpi_x}x{dpi_y}",
+                "aspect_ratio": aspect_ratio,
+            },
+        )
+
+        return (
+            f"Successfully generated 4K image with {MODEL_NAME}:\n"
+            f"- **Filename / Artifact**: `{filename}`\n"
+            f"- **Model**: `{MODEL_NAME}`\n"
+            f"- **Resolution**: {width}x{height} (4K UHD)\n"
+            f"- **DPI Metadata**: {dpi_x} DPI\n"
+            f"- **Aspect Ratio**: {aspect_ratio}\n"
+            f"- **Prompt**: \"{prompt}\""
+        )
+    except Exception as e:
+        logger.exception("Error generating 4K image with %s for user %s", MODEL_NAME, user_id)
+        log_user_activity(
+            action="generate_4k_image_failure",
+            user_id=user_id,
+            details={"prompt": prompt, "error": str(e)},
+        )
+        return f"Failed to generate 4K image with {MODEL_NAME}: {str(e)}"
+
+
+async def edit_4k_image(
+    prompt: str,
+    image_artifact_name: str = "",
+    aspect_ratio: str = "1:1",
+    tool_context: Optional[ToolContext] = None,
+) -> str:
+    """
+    Modifies or edits an existing image using text instructions with gemini-3-pro-image,
+    outputting at 4K resolution with resolution-based DPI metadata.
+
+    Args:
+        prompt: Instructions for modifying or transforming the image.
+        image_artifact_name: The filename/artifact name of the base image to modify.
+                            If omitted, the most recently saved artifact or user attachment will be used.
+        aspect_ratio: Desired output aspect ratio ('1:1', '16:9', '9:16', '4:3', '3:4').
+        tool_context: ADK ToolContext for artifact retrieval and storage.
+
+    Returns:
+        A message detailing the edited image, resolution, DPI metadata, and new artifact filename.
+    """
+    user_id = get_user_identity(tool_context)
+    log_user_activity(
+        action="edit_4k_image_request",
+        user_id=user_id,
+        details={"prompt": prompt, "image_artifact_name": image_artifact_name, "aspect_ratio": aspect_ratio},
+    )
+
+    try:
+        input_image_bytes = None
+        input_mime_type = "image/png"
+
+        if tool_context:
+            # 1. If explicit artifact name is given, try loading it
+            if image_artifact_name:
+                part = await tool_context.load_artifact(image_artifact_name)
+                if part and part.inline_data:
+                    input_image_bytes = part.inline_data.data
+                    if part.inline_data.mime_type:
+                        input_mime_type = part.inline_data.mime_type
+
+            # 2. Check session artifact store
+            if not input_image_bytes:
+                available_artifacts = await tool_context.list_artifacts()
+                if available_artifacts:
+                    latest_name = available_artifacts[-1]
+                    part = await tool_context.load_artifact(latest_name)
+                    if part and part.inline_data:
+                        input_image_bytes = part.inline_data.data
+                        if part.inline_data.mime_type:
+                            input_mime_type = part.inline_data.mime_type
+                        image_artifact_name = latest_name
+
+            # 3. Check recent user message parts in session events
+            if not input_image_bytes and hasattr(tool_context, "session") and tool_context.session:
+                events = getattr(tool_context.session, "events", [])
+                for evt in reversed(events):
+                    # Check both evt.content and legacy evt.message
+                    content_obj = getattr(evt, "content", None) or getattr(evt, "message", None)
+                    if content_obj and getattr(content_obj, "parts", None):
+                        for p in content_obj.parts:
+                            if p.inline_data and p.inline_data.mime_type and p.inline_data.mime_type.startswith("image/"):
+                                input_image_bytes = p.inline_data.data
+                                input_mime_type = p.inline_data.mime_type
+                                image_artifact_name = "Uploaded User Image"
+                                break
+                    if input_image_bytes:
+                        break
+
+        if not input_image_bytes:
+            log_user_activity(
+                action="edit_4k_image_missing_source",
+                user_id=user_id,
+                details={"prompt": prompt, "image_artifact_name": image_artifact_name},
+            )
+            return (
+                "Error: No source image found to modify. Please upload an image in the chat or "
+                "specify a valid `image_artifact_name` from previously generated images."
+            )
+
+        raw_bytes = await _execute_gemini_3_pro_image(
+            prompt=prompt,
+            input_image_bytes=input_image_bytes,
+            input_mime_type=input_mime_type,
+            aspect_ratio=aspect_ratio,
+        )
+
+        # Process to 4K and inject DPI metadata asynchronously in worker thread
+        processed_bytes, mime_type, (width, height), (dpi_x, dpi_y) = await process_and_apply_4k_dpi(
+            raw_bytes, aspect_ratio=aspect_ratio
+        )
+
+        timestamp = int(time.time())
+        filename = f"edited_4k_{timestamp}.png"
+
+        if tool_context:
+            artifact_part = types.Part.from_bytes(data=processed_bytes, mime_type=mime_type)
+            metadata = {
+                "model": MODEL_NAME,
+                "source_artifact": image_artifact_name,
+                "resolution": f"{width}x{height}",
+                "dpi": f"{dpi_x}x{dpi_y}",
+                "aspect_ratio": aspect_ratio,
+                "prompt": prompt,
+                "user_id": user_id,
+            }
+            await tool_context.save_artifact(filename=filename, artifact=artifact_part, custom_metadata=metadata)
+
+        log_user_activity(
+            action="edit_4k_image_success",
+            user_id=user_id,
+            details={
+                "prompt": prompt,
+                "source_artifact": image_artifact_name,
+                "artifact_filename": filename,
+                "resolution": f"{width}x{height}",
+                "dpi": f"{dpi_x}x{dpi_y}",
+                "aspect_ratio": aspect_ratio,
+            },
+        )
+
+        return (
+            f"Successfully edited image at 4K resolution with {MODEL_NAME}:\n"
+            f"- **New Artifact**: `{filename}`\n"
+            f"- **Source Image**: `{image_artifact_name or 'Uploaded Image'}`\n"
+            f"- **Model**: `{MODEL_NAME}`\n"
+            f"- **Resolution**: {width}x{height} (4K UHD)\n"
+            f"- **DPI Metadata**: {dpi_x} DPI\n"
+            f"- **Edit Instructions**: \"{prompt}\""
+        )
+    except Exception as e:
+        logger.exception("Error editing 4K image with %s for user %s", MODEL_NAME, user_id)
+        log_user_activity(
+            action="edit_4k_image_failure",
+            user_id=user_id,
+            details={"prompt": prompt, "error": str(e)},
+        )
+        return f"Failed to edit image with {MODEL_NAME}: {str(e)}"

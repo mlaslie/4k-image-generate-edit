@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+.env
+image_agent/.env
+.adk/
+image_agent/.adk/
+*.log
+.pytest_cache/
+image_agent_tmp*
+.DS_Store
+*.png
