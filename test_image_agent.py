@@ -51,7 +51,7 @@ def test_root_agent_definition():
 @pytest.mark.anyio
 @patch("image_agent.tools._execute_gemini_3_pro_image")
 @patch("image_agent.tools._upload_to_gcs_async")
-async def test_generate_4k_image_tool_file_data(mock_upload, mock_exec):
+async def test_generate_4k_image_tool_no_artifact_delta(mock_upload, mock_exec):
     img = Image.new("RGB", (5504, 3072), color="blue")
     buf = io.BytesIO()
     img.save(buf, format="PNG")
@@ -60,7 +60,6 @@ async def test_generate_4k_image_tool_file_data(mock_upload, mock_exec):
 
     mock_tool_ctx = MagicMock()
     mock_tool_ctx.user_id = "artist@agency.com"
-    mock_tool_ctx.save_artifact = AsyncMock()
 
     result = await generate_4k_image(
         prompt="A futuristic cyber city at night",
@@ -71,27 +70,16 @@ async def test_generate_4k_image_tool_file_data(mock_upload, mock_exec):
     assert "5504x3072" in result
     assert "300 DPI" in result
     assert "gs://image-editing-agent-artifacts/artifacts/generated_123.png" in result
-    assert mock_tool_ctx.save_artifact.called
-    saved_args = mock_tool_ctx.save_artifact.call_args
-    assert saved_args.kwargs["filename"].startswith("generated_")
-    assert saved_args.kwargs["custom_metadata"]["gcs_uri"] == "gs://image-editing-agent-artifacts/artifacts/generated_123.png"
-    # Ensure saved artifact is a file_data reference (zero raw bytes)
-    saved_artifact = saved_args.kwargs["artifact"]
-    assert hasattr(saved_artifact, "file_data") and saved_artifact.file_data is not None
-    assert saved_artifact.file_data.file_uri == "gs://image-editing-agent-artifacts/artifacts/generated_123.png"
+    assert "https://storage.cloud.google.com/image-editing-agent-artifacts/artifacts/generated_" in result
 
 @pytest.mark.anyio
 @patch("image_agent.tools._execute_gemini_3_pro_image")
 @patch("image_agent.tools._upload_to_gcs_async")
-async def test_edit_4k_image_tool_file_data(mock_upload, mock_exec):
+async def test_edit_4k_image_tool_no_artifact_delta(mock_upload, mock_exec):
     mock_upload.return_value = "gs://image-editing-agent-artifacts/artifacts/edited_456.png"
-    part_ref = types.Part.from_uri(file_uri="gs://image-editing-agent-artifacts/artifacts/generated_123.png", mime_type="image/png")
     
     mock_tool_ctx = MagicMock()
     mock_tool_ctx.user_id = "designer@agency.com"
-    mock_tool_ctx.list_artifacts = AsyncMock(return_value=["generated_123.png"])
-    mock_tool_ctx.load_artifact = AsyncMock(return_value=part_ref)
-    mock_tool_ctx.save_artifact = AsyncMock()
 
     edited_img = Image.new("RGB", (4096, 4096), color="yellow")
     edited_buf = io.BytesIO()
@@ -109,12 +97,7 @@ async def test_edit_4k_image_tool_file_data(mock_upload, mock_exec):
     assert "4096x4096" in result
     assert "300 DPI" in result
     assert "gs://image-editing-agent-artifacts/artifacts/edited_456.png" in result
-    assert mock_tool_ctx.save_artifact.called
-    saved_args = mock_tool_ctx.save_artifact.call_args
-    assert saved_args.kwargs["custom_metadata"]["gcs_uri"] == "gs://image-editing-agent-artifacts/artifacts/edited_456.png"
-    # Ensure saved artifact is a file_data reference
-    saved_artifact = saved_args.kwargs["artifact"]
-    assert hasattr(saved_artifact, "file_data") and saved_artifact.file_data is not None
+    assert "https://storage.cloud.google.com/image-editing-agent-artifacts/artifacts/edited_" in result
 
 def test_get_user_identity_variations():
     assert get_user_identity(None) == "unknown"

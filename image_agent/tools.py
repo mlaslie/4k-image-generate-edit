@@ -338,7 +338,7 @@ async def generate_4k_image(
 ) -> str:
     """
     Generates a high-quality image using gemini-3-pro-image with native generation_config parameters.
-    Saves artifacts as zero-memory file_data references (gs://) in context and returns clickable GCS download links.
+    Saves image directly to GCS (NO tool_context.save_artifact to avoid artifact_delta echoes in GE).
 
     Args:
         prompt: Detailed description of the image to generate.
@@ -346,7 +346,7 @@ async def generate_4k_image(
                       If omitted or empty, the model automatically determines the best composition aspect ratio.
         image_size: Target resolution ('4K', '2K', '1K'). Defaults to '4K'.
         negative_prompt: Optional elements to exclude from the generated image.
-        tool_context: ADK ToolContext for artifact storage and session management.
+        tool_context: ADK ToolContext for user identity and session management.
 
     Returns:
         A message detailing the generated image, resolution, DPI metadata, clickable download links, and artifact filename.
@@ -384,21 +384,10 @@ async def generate_4k_image(
         https_view_url = f"https://storage.cloud.google.com/{GCS_BUCKET_NAME}/artifacts/{filename}"
         console_url = f"https://console.cloud.google.com/storage/browser/_details/{GCS_BUCKET_NAME}/artifacts/{filename}?project={GCP_PROJECT}"
 
-        # Save artifact as lightweight file_data reference (ZERO raw bytes in memory context)
-        if tool_context:
-            artifact_file_ref = types.Part.from_uri(file_uri=gcs_uri, mime_type=mime_type)
-            metadata = {
-                "model": MODEL_NAME,
-                "resolution": f"{width}x{height}",
-                "dpi": f"{dpi_x}x{dpi_y}",
-                "aspect_ratio": aspect_ratio or "auto",
-                "image_size": image_size or "4K",
-                "prompt": prompt,
-                "user_id": user_id,
-                "gcs_uri": gcs_uri,
-                "https_url": https_view_url,
-            }
-            await tool_context.save_artifact(filename=filename, artifact=artifact_file_ref, custom_metadata=metadata)
+        # NOTE: DO NOT call tool_context.save_artifact(...) here!
+        # Calling save_artifact triggers ADK artifact_delta, causing Gemini Enterprise to echo back
+        # the entire 25-35MB image payload in subsequent request payloads until the 32MB gateway limit is exceeded.
+        # Direct GCS upload completely avoids the payload size limit!
 
         # Immediately free container memory buffers
         del raw_bytes, processed_bytes
@@ -450,16 +439,16 @@ async def edit_4k_image(
 ) -> str:
     """
     Modifies or edits an existing image using text instructions with gemini-3-pro-image.
-    Uses zero-memory GCS file_data references (gs://) and returns clickable GCS download links.
+    Loads source directly from GCS URI and saves directly to GCS without registering artifact_delta.
 
     Args:
         prompt: Instructions for modifying or transforming the image.
         image_artifact_name: The filename/artifact name or gs:// URI of the base image to modify.
-                            If omitted, the most recently saved artifact or user attachment will be used.
+                            If omitted, the most recently uploaded image in the session will be used.
         aspect_ratio: Desired output aspect ratio (e.g., '1:1', '16:9', '9:16', '4:3', '3:4', '21:9', '3:2', '2:3').
                       If omitted or empty, preserves / auto-determines aspect ratio.
         image_size: Target resolution ('4K', '2K', '1K'). Defaults to '4K'.
-        tool_context: ADK ToolContext for artifact retrieval and storage.
+        tool_context: ADK ToolContext for session events and user identity.
 
     Returns:
         A message detailing the edited image, resolution, DPI metadata, clickable download links, and new artifact filename.
@@ -482,49 +471,32 @@ async def edit_4k_image(
         input_mime_type: str = "image/png"
 
         # 1. Direct gs:// URI given in parameter
-        if image_artifact_name and image_artifact_name.startswith("gs://"):
-            input_image_uri = image_artifact_name
+        if image_artifact_name:
+            if image_artifact_name.startswith("gs://"):
+                input_image_uri = image_artifact_name
+            else:
+                input_image_uri = f"gs://{GCS_BUCKET_NAME}/artifacts/{image_artifact_name}"
 
-        # 2. Check artifact store in tool_context
-        if not input_image_uri and tool_context:
-            target_name = image_artifact_name
-            if not target_name:
-                available_artifacts = await tool_context.list_artifacts()
-                if available_artifacts:
-                    target_name = available_artifacts[-1]
+        # 2. Check session events for recent image attachments or filenames if omitted
+        if not input_image_uri and hasattr(tool_context, "session") and tool_context.session:
+            events = getattr(tool_context.session, "events", [])
+            for evt in reversed(events):
+                content_obj = getattr(evt, "content", None) or getattr(evt, "message", None)
+                if content_obj and getattr(content_obj, "parts", None):
+                    for p in content_obj.parts:
+                        if hasattr(p, "file_data") and p.file_data and p.file_data.file_uri:
+                            input_image_uri = p.file_data.file_uri
+                            input_mime_type = p.file_data.mime_type or "image/png"
+                            break
+                        elif hasattr(p, "inline_data") and p.inline_data and p.inline_data.data:
+                            temp_upload_name = f"user_upload_{int(time.time())}.png"
+                            input_image_uri = await _upload_to_gcs_async(temp_upload_name, p.inline_data.data, p.inline_data.mime_type or "image/png")
+                            input_mime_type = p.inline_data.mime_type or "image/png"
+                            break
+                if input_image_uri:
+                    break
 
-            if target_name:
-                part = await tool_context.load_artifact(target_name)
-                if part:
-                    if hasattr(part, "file_data") and part.file_data and part.file_data.file_uri:
-                        input_image_uri = part.file_data.file_uri
-                        input_mime_type = part.file_data.mime_type or "image/png"
-                    elif hasattr(part, "inline_data") and part.inline_data and part.inline_data.data:
-                        temp_name = f"ref_{int(time.time())}.png"
-                        input_image_uri = await _upload_to_gcs_async(temp_name, part.inline_data.data, part.inline_data.mime_type or "image/png")
-                        input_mime_type = part.inline_data.mime_type or "image/png"
-                else:
-                    input_image_uri = f"gs://{GCS_BUCKET_NAME}/artifacts/{target_name}"
-
-            # 3. Check recent user attachments in session events if still no URI
-            if not input_image_uri and hasattr(tool_context, "session") and tool_context.session:
-                events = getattr(tool_context.session, "events", [])
-                for evt in reversed(events):
-                    content_obj = getattr(evt, "content", None) or getattr(evt, "message", None)
-                    if content_obj and getattr(content_obj, "parts", None):
-                        for p in content_obj.parts:
-                            if hasattr(p, "file_data") and p.file_data and p.file_data.file_uri:
-                                input_image_uri = p.file_data.file_uri
-                                input_mime_type = p.file_data.mime_type or "image/png"
-                                break
-                            elif hasattr(p, "inline_data") and p.inline_data and p.inline_data.data:
-                                temp_upload_name = f"user_upload_{int(time.time())}.png"
-                                input_image_uri = await _upload_to_gcs_async(temp_upload_name, p.inline_data.data, p.inline_data.mime_type or "image/png")
-                                input_mime_type = p.inline_data.mime_type or "image/png"
-                                break
-                    if input_image_uri:
-                        break
-
+        # Fallback if no specific URI found
         if not input_image_uri and not input_image_bytes:
             log_user_activity(
                 action="edit_image_missing_source",
@@ -532,8 +504,8 @@ async def edit_4k_image(
                 details={"prompt": prompt, "image_artifact_name": image_artifact_name},
             )
             return (
-                "Error: No source image found to modify. Please upload an image in the chat or "
-                "specify a valid `image_artifact_name` from previously generated images."
+                "Error: No source image found to modify. Please specify the `image_artifact_name` "
+                "(e.g., `generated_1787858012.png`) or upload an image in the chat."
             )
 
         raw_bytes = await _execute_gemini_3_pro_image(
@@ -558,22 +530,7 @@ async def edit_4k_image(
         https_view_url = f"https://storage.cloud.google.com/{GCS_BUCKET_NAME}/artifacts/{filename}"
         console_url = f"https://console.cloud.google.com/storage/browser/_details/{GCS_BUCKET_NAME}/artifacts/{filename}?project={GCP_PROJECT}"
 
-        # Save artifact as zero-memory file_data reference in context
-        if tool_context:
-            artifact_file_ref = types.Part.from_uri(file_uri=gcs_uri, mime_type=mime_type)
-            metadata = {
-                "model": MODEL_NAME,
-                "source_artifact": image_artifact_name or input_image_uri,
-                "resolution": f"{width}x{height}",
-                "dpi": f"{dpi_x}x{dpi_y}",
-                "aspect_ratio": aspect_ratio or "auto",
-                "image_size": image_size or "4K",
-                "prompt": prompt,
-                "user_id": user_id,
-                "gcs_uri": gcs_uri,
-                "https_url": https_view_url,
-            }
-            await tool_context.save_artifact(filename=filename, artifact=artifact_file_ref, custom_metadata=metadata)
+        # NOTE: DO NOT call tool_context.save_artifact(...) here to prevent GE payload ballooning!
 
         # Explicit garbage collection
         del raw_bytes, processed_bytes
