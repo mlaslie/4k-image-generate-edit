@@ -16,15 +16,6 @@ logger = logging.getLogger(__name__)
 # Primary model requested
 MODEL_NAME = "gemini-3-pro-image"
 
-# Target 4K dimensions
-RESOLUTION_MAP = {
-    "1:1": (4096, 4096),
-    "16:9": (3840, 2160),
-    "9:16": (2160, 3840),
-    "4:3": (3840, 2880),
-    "3:4": (2880, 3840),
-}
-
 # --- Client & Logger Singletons ---
 _gcp_logging_client: Optional[Any] = None
 _gcp_audit_logger: Optional[Any] = None
@@ -49,7 +40,6 @@ def get_logging_client():
     try:
         project = os.environ.get("GOOGLE_CLOUD_PROJECT", "laslie-demo-project")
         import google.cloud.logging
-        from google.cloud.logging_v2.resource import Resource
 
         _gcp_logging_client = google.cloud.logging.Client(project=project)
         _gcp_audit_logger = _gcp_logging_client.logger("image_agent_user_audit")
@@ -207,17 +197,11 @@ def calculate_dpi_for_resolution(width: int, height: int) -> Tuple[int, int]:
         return (72, 72)
 
 
-def _sync_process_and_apply_4k_dpi(
+def _sync_process_and_apply_dpi(
     image_bytes: bytes,
-    aspect_ratio: str = "1:1",
 ) -> Tuple[bytes, str, Tuple[int, int], Tuple[int, int]]:
-    """Synchronous CPU worker for image resizing and DPI injection."""
+    """Synchronous CPU worker for DPI metadata injection."""
     img = Image.open(io.BytesIO(image_bytes))
-
-    target_dim = RESOLUTION_MAP.get(aspect_ratio, (4096, 4096))
-    if img.width < target_dim[0] or img.height < target_dim[1]:
-        img = img.resize(target_dim, Image.Resampling.LANCZOS)
-
     width, height = img.size
     dpi = calculate_dpi_for_resolution(width, height)
 
@@ -231,15 +215,14 @@ def _sync_process_and_apply_4k_dpi(
     return output_buf.getvalue(), mime_type, (width, height), dpi
 
 
-async def process_and_apply_4k_dpi(
+async def process_and_apply_dpi(
     image_bytes: bytes,
-    aspect_ratio: str = "1:1",
 ) -> Tuple[bytes, str, Tuple[int, int], Tuple[int, int]]:
     """
-    Asynchronously processes image to 4K resolution and injects DPI metadata in a worker thread.
+    Asynchronously injects DPI metadata in a worker thread.
     Prevents blocking the async event loop.
     """
-    return await asyncio.to_thread(_sync_process_and_apply_4k_dpi, image_bytes, aspect_ratio)
+    return await asyncio.to_thread(_sync_process_and_apply_dpi, image_bytes)
 
 
 def _extract_image_bytes(response: Any) -> Optional[bytes]:
@@ -257,20 +240,30 @@ async def _execute_gemini_3_pro_image(
     prompt: str,
     input_image_bytes: Optional[bytes] = None,
     input_mime_type: str = "image/png",
-    aspect_ratio: str = "1:1",
+    aspect_ratio: str = "",
+    image_size: str = "4K",
     max_retries: int = 3,
 ) -> bytes:
     """
-    Executes gemini-3-pro-image on Vertex AI / Google AI with ADC and exponential retry.
+    Executes gemini-3-pro-image on Vertex AI / Google AI using native generation_config image_config.
+    Cleanly passes aspect_ratio and image_size in image_config rather than in the prompt.
     """
     client = get_genai_client()
     contents = []
     if input_image_bytes:
         contents.append(types.Part.from_bytes(data=input_image_bytes, mime_type=input_mime_type))
-    contents.append(f"{prompt}, rendered in 4K resolution, aspect ratio {aspect_ratio}")
+    contents.append(prompt)
+
+    # Build image_config cleanly as generation_config parameters
+    image_config_kwargs: Dict[str, Any] = {
+        "image_size": image_size or "4K",
+    }
+    if aspect_ratio and aspect_ratio.strip():
+        image_config_kwargs["aspect_ratio"] = aspect_ratio.strip()
 
     config = types.GenerateContentConfig(
         response_modalities=["IMAGE", "TEXT"],
+        image_config=types.ImageConfig(**image_config_kwargs),
     )
 
     last_err = None
@@ -298,17 +291,19 @@ async def _execute_gemini_3_pro_image(
 
 async def generate_4k_image(
     prompt: str,
-    aspect_ratio: str = "1:1",
+    aspect_ratio: str = "",
+    image_size: str = "4K",
     negative_prompt: str = "",
     tool_context: Optional[ToolContext] = None,
 ) -> str:
     """
-    Generates a high-quality 4K resolution image using the gemini-3-pro-image model
-    and embeds DPI metadata based on the output resolution.
+    Generates a high-quality image using gemini-3-pro-image with native generation_config parameters.
 
     Args:
         prompt: Detailed description of the image to generate.
-        aspect_ratio: Aspect ratio of the output image ('1:1', '16:9', '9:16', '4:3', '3:4'). Default is '1:1'.
+        aspect_ratio: Aspect ratio of the output image (e.g., '1:1', '16:9', '9:16', '4:3', '3:4', '21:9', '3:2', '2:3').
+                      If omitted or empty, the model automatically determines the best composition aspect ratio.
+        image_size: Target resolution ('4K', '2K', '1K'). Defaults to '4K'.
         negative_prompt: Optional elements to exclude from the generated image.
         tool_context: ADK ToolContext for artifact storage and session management.
 
@@ -317,9 +312,14 @@ async def generate_4k_image(
     """
     user_id = get_user_identity(tool_context)
     log_user_activity(
-        action="generate_4k_image_request",
+        action="generate_image_request",
         user_id=user_id,
-        details={"prompt": prompt, "aspect_ratio": aspect_ratio, "negative_prompt": negative_prompt},
+        details={
+            "prompt": prompt,
+            "aspect_ratio": aspect_ratio or "auto",
+            "image_size": image_size or "4K",
+            "negative_prompt": negative_prompt,
+        },
     )
 
     try:
@@ -327,15 +327,14 @@ async def generate_4k_image(
         raw_bytes = await _execute_gemini_3_pro_image(
             prompt=full_prompt,
             aspect_ratio=aspect_ratio,
+            image_size=image_size or "4K",
         )
 
-        # Process to 4K and inject DPI metadata asynchronously in worker thread
-        processed_bytes, mime_type, (width, height), (dpi_x, dpi_y) = await process_and_apply_4k_dpi(
-            raw_bytes, aspect_ratio=aspect_ratio
-        )
+        # Inject DPI metadata asynchronously in worker thread
+        processed_bytes, mime_type, (width, height), (dpi_x, dpi_y) = await process_and_apply_dpi(raw_bytes)
 
         timestamp = int(time.time())
-        filename = f"generated_4k_{timestamp}.png"
+        filename = f"generated_{timestamp}.png"
 
         if tool_context:
             artifact_part = types.Part.from_bytes(data=processed_bytes, mime_type=mime_type)
@@ -343,58 +342,63 @@ async def generate_4k_image(
                 "model": MODEL_NAME,
                 "resolution": f"{width}x{height}",
                 "dpi": f"{dpi_x}x{dpi_y}",
-                "aspect_ratio": aspect_ratio,
+                "aspect_ratio": aspect_ratio or "auto",
+                "image_size": image_size or "4K",
                 "prompt": prompt,
                 "user_id": user_id,
             }
             await tool_context.save_artifact(filename=filename, artifact=artifact_part, custom_metadata=metadata)
 
         log_user_activity(
-            action="generate_4k_image_success",
+            action="generate_image_success",
             user_id=user_id,
             details={
                 "prompt": prompt,
                 "artifact_filename": filename,
                 "resolution": f"{width}x{height}",
                 "dpi": f"{dpi_x}x{dpi_y}",
-                "aspect_ratio": aspect_ratio,
+                "aspect_ratio": aspect_ratio or "auto",
+                "image_size": image_size or "4K",
             },
         )
 
+        aspect_label = aspect_ratio if aspect_ratio else "Auto-determined by model"
         return (
-            f"Successfully generated 4K image with {MODEL_NAME}:\n"
+            f"Successfully generated image with {MODEL_NAME}:\n"
             f"- **Filename / Artifact**: `{filename}`\n"
             f"- **Model**: `{MODEL_NAME}`\n"
-            f"- **Resolution**: {width}x{height} (4K UHD)\n"
+            f"- **Resolution**: {width}x{height} ({image_size or '4K'})\n"
             f"- **DPI Metadata**: {dpi_x} DPI\n"
-            f"- **Aspect Ratio**: {aspect_ratio}\n"
+            f"- **Aspect Ratio**: {aspect_label}\n"
             f"- **Prompt**: \"{prompt}\""
         )
     except Exception as e:
-        logger.exception("Error generating 4K image with %s for user %s", MODEL_NAME, user_id)
+        logger.exception("Error generating image with %s for user %s", MODEL_NAME, user_id)
         log_user_activity(
-            action="generate_4k_image_failure",
+            action="generate_image_failure",
             user_id=user_id,
             details={"prompt": prompt, "error": str(e)},
         )
-        return f"Failed to generate 4K image with {MODEL_NAME}: {str(e)}"
+        return f"Failed to generate image with {MODEL_NAME}: {str(e)}"
 
 
 async def edit_4k_image(
     prompt: str,
     image_artifact_name: str = "",
-    aspect_ratio: str = "1:1",
+    aspect_ratio: str = "",
+    image_size: str = "4K",
     tool_context: Optional[ToolContext] = None,
 ) -> str:
     """
-    Modifies or edits an existing image using text instructions with gemini-3-pro-image,
-    outputting at 4K resolution with resolution-based DPI metadata.
+    Modifies or edits an existing image using text instructions with gemini-3-pro-image.
 
     Args:
         prompt: Instructions for modifying or transforming the image.
         image_artifact_name: The filename/artifact name of the base image to modify.
                             If omitted, the most recently saved artifact or user attachment will be used.
-        aspect_ratio: Desired output aspect ratio ('1:1', '16:9', '9:16', '4:3', '3:4').
+        aspect_ratio: Desired output aspect ratio (e.g., '1:1', '16:9', '9:16', '4:3', '3:4', '21:9', '3:2', '2:3').
+                      If omitted or empty, preserves / auto-determines aspect ratio.
+        image_size: Target resolution ('4K', '2K', '1K'). Defaults to '4K'.
         tool_context: ADK ToolContext for artifact retrieval and storage.
 
     Returns:
@@ -402,9 +406,14 @@ async def edit_4k_image(
     """
     user_id = get_user_identity(tool_context)
     log_user_activity(
-        action="edit_4k_image_request",
+        action="edit_image_request",
         user_id=user_id,
-        details={"prompt": prompt, "image_artifact_name": image_artifact_name, "aspect_ratio": aspect_ratio},
+        details={
+            "prompt": prompt,
+            "image_artifact_name": image_artifact_name,
+            "aspect_ratio": aspect_ratio or "auto",
+            "image_size": image_size or "4K",
+        },
     )
 
     try:
@@ -436,7 +445,6 @@ async def edit_4k_image(
             if not input_image_bytes and hasattr(tool_context, "session") and tool_context.session:
                 events = getattr(tool_context.session, "events", [])
                 for evt in reversed(events):
-                    # Check both evt.content and legacy evt.message
                     content_obj = getattr(evt, "content", None) or getattr(evt, "message", None)
                     if content_obj and getattr(content_obj, "parts", None):
                         for p in content_obj.parts:
@@ -450,7 +458,7 @@ async def edit_4k_image(
 
         if not input_image_bytes:
             log_user_activity(
-                action="edit_4k_image_missing_source",
+                action="edit_image_missing_source",
                 user_id=user_id,
                 details={"prompt": prompt, "image_artifact_name": image_artifact_name},
             )
@@ -464,15 +472,14 @@ async def edit_4k_image(
             input_image_bytes=input_image_bytes,
             input_mime_type=input_mime_type,
             aspect_ratio=aspect_ratio,
+            image_size=image_size or "4K",
         )
 
-        # Process to 4K and inject DPI metadata asynchronously in worker thread
-        processed_bytes, mime_type, (width, height), (dpi_x, dpi_y) = await process_and_apply_4k_dpi(
-            raw_bytes, aspect_ratio=aspect_ratio
-        )
+        # Inject DPI metadata asynchronously in worker thread
+        processed_bytes, mime_type, (width, height), (dpi_x, dpi_y) = await process_and_apply_dpi(raw_bytes)
 
         timestamp = int(time.time())
-        filename = f"edited_4k_{timestamp}.png"
+        filename = f"edited_{timestamp}.png"
 
         if tool_context:
             artifact_part = types.Part.from_bytes(data=processed_bytes, mime_type=mime_type)
@@ -481,14 +488,15 @@ async def edit_4k_image(
                 "source_artifact": image_artifact_name,
                 "resolution": f"{width}x{height}",
                 "dpi": f"{dpi_x}x{dpi_y}",
-                "aspect_ratio": aspect_ratio,
+                "aspect_ratio": aspect_ratio or "auto",
+                "image_size": image_size or "4K",
                 "prompt": prompt,
                 "user_id": user_id,
             }
             await tool_context.save_artifact(filename=filename, artifact=artifact_part, custom_metadata=metadata)
 
         log_user_activity(
-            action="edit_4k_image_success",
+            action="edit_image_success",
             user_id=user_id,
             details={
                 "prompt": prompt,
@@ -496,23 +504,26 @@ async def edit_4k_image(
                 "artifact_filename": filename,
                 "resolution": f"{width}x{height}",
                 "dpi": f"{dpi_x}x{dpi_y}",
-                "aspect_ratio": aspect_ratio,
+                "aspect_ratio": aspect_ratio or "auto",
+                "image_size": image_size or "4K",
             },
         )
 
+        aspect_label = aspect_ratio if aspect_ratio else "Preserved / Auto-determined"
         return (
-            f"Successfully edited image at 4K resolution with {MODEL_NAME}:\n"
+            f"Successfully edited image with {MODEL_NAME}:\n"
             f"- **New Artifact**: `{filename}`\n"
             f"- **Source Image**: `{image_artifact_name or 'Uploaded Image'}`\n"
             f"- **Model**: `{MODEL_NAME}`\n"
-            f"- **Resolution**: {width}x{height} (4K UHD)\n"
+            f"- **Resolution**: {width}x{height} ({image_size or '4K'})\n"
             f"- **DPI Metadata**: {dpi_x} DPI\n"
+            f"- **Aspect Ratio**: {aspect_label}\n"
             f"- **Edit Instructions**: \"{prompt}\""
         )
     except Exception as e:
-        logger.exception("Error editing 4K image with %s for user %s", MODEL_NAME, user_id)
+        logger.exception("Error editing image with %s for user %s", MODEL_NAME, user_id)
         log_user_activity(
-            action="edit_4k_image_failure",
+            action="edit_image_failure",
             user_id=user_id,
             details={"prompt": prompt, "error": str(e)},
         )
