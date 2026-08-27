@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 # Primary model requested
 MODEL_NAME = "gemini-3-pro-image"
 GCS_BUCKET_NAME = os.environ.get("GCS_ARTIFACT_BUCKET", "image-editing-agent-artifacts")
+GCP_PROJECT = os.environ.get("GOOGLE_CLOUD_PROJECT", "laslie-demo-project")
 
 # --- Client & Logger Singletons ---
 _gcp_logging_client: Optional[Any] = None
@@ -337,7 +338,7 @@ async def generate_4k_image(
 ) -> str:
     """
     Generates a high-quality image using gemini-3-pro-image with native generation_config parameters.
-    Saves artifacts as zero-memory file_data references (gs://) in context.
+    Saves artifacts as zero-memory file_data references (gs://) in context and returns clickable GCS download links.
 
     Args:
         prompt: Detailed description of the image to generate.
@@ -348,7 +349,7 @@ async def generate_4k_image(
         tool_context: ADK ToolContext for artifact storage and session management.
 
     Returns:
-        A message detailing the generated image, resolution, DPI metadata, GCS URI, and artifact filename.
+        A message detailing the generated image, resolution, DPI metadata, clickable download links, and artifact filename.
     """
     user_id = get_user_identity(tool_context)
     log_user_activity(
@@ -379,6 +380,10 @@ async def generate_4k_image(
         # Stream directly to GCS external storage
         gcs_uri = await _upload_to_gcs_async(filename, processed_bytes, mime_type)
 
+        # Direct clickable HTTPS download URL and Console explorer URL
+        https_view_url = f"https://storage.cloud.google.com/{GCS_BUCKET_NAME}/artifacts/{filename}"
+        console_url = f"https://console.cloud.google.com/storage/browser/_details/{GCS_BUCKET_NAME}/artifacts/{filename}?project={GCP_PROJECT}"
+
         # Save artifact as lightweight file_data reference (ZERO raw bytes in memory context)
         if tool_context:
             artifact_file_ref = types.Part.from_uri(file_uri=gcs_uri, mime_type=mime_type)
@@ -391,6 +396,7 @@ async def generate_4k_image(
                 "prompt": prompt,
                 "user_id": user_id,
                 "gcs_uri": gcs_uri,
+                "https_url": https_view_url,
             }
             await tool_context.save_artifact(filename=filename, artifact=artifact_file_ref, custom_metadata=metadata)
 
@@ -405,6 +411,7 @@ async def generate_4k_image(
                 "prompt": prompt,
                 "artifact_filename": filename,
                 "gcs_uri": gcs_uri,
+                "https_url": https_view_url,
                 "resolution": f"{width}x{height}",
                 "dpi": f"{dpi_x}x{dpi_y}",
                 "aspect_ratio": aspect_ratio or "auto",
@@ -415,8 +422,9 @@ async def generate_4k_image(
         aspect_label = aspect_ratio if aspect_ratio else "Auto-determined by model"
         return (
             f"Successfully generated image with {MODEL_NAME}:\n"
-            f"- **Filename / Artifact**: `{filename}`\n"
-            f"- **GCS Storage**: `{gcs_uri}`\n"
+            f"- **Direct Download / View**: [{filename}]({https_view_url})\n"
+            f"- **GCS Console**: [Open in Google Cloud Console]({console_url})\n"
+            f"- **GCS URI**: `{gcs_uri}`\n"
             f"- **Model**: `{MODEL_NAME}`\n"
             f"- **Resolution**: {width}x{height} ({image_size or '4K'})\n"
             f"- **DPI Metadata**: {dpi_x} DPI\n"
@@ -442,7 +450,7 @@ async def edit_4k_image(
 ) -> str:
     """
     Modifies or edits an existing image using text instructions with gemini-3-pro-image.
-    Uses zero-memory GCS file_data references (gs://) to eliminate multi-turn memory accumulation.
+    Uses zero-memory GCS file_data references (gs://) and returns clickable GCS download links.
 
     Args:
         prompt: Instructions for modifying or transforming the image.
@@ -454,7 +462,7 @@ async def edit_4k_image(
         tool_context: ADK ToolContext for artifact retrieval and storage.
 
     Returns:
-        A message detailing the edited image, resolution, DPI metadata, GCS URI, and new artifact filename.
+        A message detailing the edited image, resolution, DPI metadata, clickable download links, and new artifact filename.
     """
     user_id = get_user_identity(tool_context)
     log_user_activity(
@@ -488,17 +496,14 @@ async def edit_4k_image(
             if target_name:
                 part = await tool_context.load_artifact(target_name)
                 if part:
-                    # Check for file_data reference first (preferred: 0 bytes in memory)
                     if hasattr(part, "file_data") and part.file_data and part.file_data.file_uri:
                         input_image_uri = part.file_data.file_uri
                         input_mime_type = part.file_data.mime_type or "image/png"
                     elif hasattr(part, "inline_data") and part.inline_data and part.inline_data.data:
-                        # Fallback: if raw bytes stored, upload to GCS to externalize
                         temp_name = f"ref_{int(time.time())}.png"
                         input_image_uri = await _upload_to_gcs_async(temp_name, part.inline_data.data, part.inline_data.mime_type or "image/png")
                         input_mime_type = part.inline_data.mime_type or "image/png"
                 else:
-                    # Default canonical GCS path for named artifact
                     input_image_uri = f"gs://{GCS_BUCKET_NAME}/artifacts/{target_name}"
 
             # 3. Check recent user attachments in session events if still no URI
@@ -549,6 +554,10 @@ async def edit_4k_image(
         # Stream directly to GCS external storage
         gcs_uri = await _upload_to_gcs_async(filename, processed_bytes, mime_type)
 
+        # Direct clickable HTTPS download URL and Console explorer URL
+        https_view_url = f"https://storage.cloud.google.com/{GCS_BUCKET_NAME}/artifacts/{filename}"
+        console_url = f"https://console.cloud.google.com/storage/browser/_details/{GCS_BUCKET_NAME}/artifacts/{filename}?project={GCP_PROJECT}"
+
         # Save artifact as zero-memory file_data reference in context
         if tool_context:
             artifact_file_ref = types.Part.from_uri(file_uri=gcs_uri, mime_type=mime_type)
@@ -562,6 +571,7 @@ async def edit_4k_image(
                 "prompt": prompt,
                 "user_id": user_id,
                 "gcs_uri": gcs_uri,
+                "https_url": https_view_url,
             }
             await tool_context.save_artifact(filename=filename, artifact=artifact_file_ref, custom_metadata=metadata)
 
@@ -577,6 +587,7 @@ async def edit_4k_image(
                 "source_artifact": image_artifact_name or input_image_uri,
                 "artifact_filename": filename,
                 "gcs_uri": gcs_uri,
+                "https_url": https_view_url,
                 "resolution": f"{width}x{height}",
                 "dpi": f"{dpi_x}x{dpi_y}",
                 "aspect_ratio": aspect_ratio or "auto",
@@ -587,8 +598,9 @@ async def edit_4k_image(
         aspect_label = aspect_ratio if aspect_ratio else "Preserved / Auto-determined"
         return (
             f"Successfully edited image with {MODEL_NAME}:\n"
-            f"- **New Artifact**: `{filename}`\n"
-            f"- **GCS Storage**: `{gcs_uri}`\n"
+            f"- **Direct Download / View**: [{filename}]({https_view_url})\n"
+            f"- **GCS Console**: [Open in Google Cloud Console]({console_url})\n"
+            f"- **GCS URI**: `{gcs_uri}`\n"
             f"- **Source Image**: `{image_artifact_name or input_image_uri or 'Uploaded Image'}`\n"
             f"- **Model**: `{MODEL_NAME}`\n"
             f"- **Resolution**: {width}x{height} ({image_size or '4K'})\n"
