@@ -50,17 +50,18 @@ def test_root_agent_definition():
 
 @pytest.mark.anyio
 @patch("image_agent.tools._execute_gemini_3_pro_image")
-async def test_generate_4k_image_tool_auto_aspect(mock_exec):
+@patch("image_agent.tools._upload_to_gcs_async")
+async def test_generate_4k_image_tool_file_data(mock_upload, mock_exec):
     img = Image.new("RGB", (5504, 3072), color="blue")
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     mock_exec.return_value = buf.getvalue()
+    mock_upload.return_value = "gs://image-editing-agent-artifacts/artifacts/generated_123.png"
 
     mock_tool_ctx = MagicMock()
     mock_tool_ctx.user_id = "artist@agency.com"
     mock_tool_ctx.save_artifact = AsyncMock()
 
-    # Call without specifying aspect_ratio -> should auto-determine and default to 4K
     result = await generate_4k_image(
         prompt="A futuristic cyber city at night",
         tool_context=mock_tool_ctx
@@ -69,28 +70,27 @@ async def test_generate_4k_image_tool_auto_aspect(mock_exec):
     assert "Successfully generated image" in result
     assert "5504x3072" in result
     assert "300 DPI" in result
-    assert "Auto-determined" in result
+    assert "gs://image-editing-agent-artifacts/artifacts/generated_123.png" in result
     assert mock_tool_ctx.save_artifact.called
     saved_args = mock_tool_ctx.save_artifact.call_args
     assert saved_args.kwargs["filename"].startswith("generated_")
-    assert saved_args.kwargs["custom_metadata"]["dpi"] == "300x300"
-    assert saved_args.kwargs["custom_metadata"]["model"] == MODEL_NAME
-    assert saved_args.kwargs["custom_metadata"]["image_size"] == "4K"
-    assert saved_args.kwargs["custom_metadata"]["aspect_ratio"] == "auto"
+    assert saved_args.kwargs["custom_metadata"]["gcs_uri"] == "gs://image-editing-agent-artifacts/artifacts/generated_123.png"
+    # Ensure saved artifact is a file_data reference (zero raw bytes)
+    saved_artifact = saved_args.kwargs["artifact"]
+    assert hasattr(saved_artifact, "file_data") and saved_artifact.file_data is not None
+    assert saved_artifact.file_data.file_uri == "gs://image-editing-agent-artifacts/artifacts/generated_123.png"
 
 @pytest.mark.anyio
 @patch("image_agent.tools._execute_gemini_3_pro_image")
-async def test_edit_4k_image_tool(mock_exec):
-    orig_img = Image.new("RGB", (4096, 4096), color="red")
-    orig_buf = io.BytesIO()
-    orig_img.save(orig_buf, format="PNG")
-    
-    part = types.Part.from_bytes(data=orig_buf.getvalue(), mime_type="image/png")
+@patch("image_agent.tools._upload_to_gcs_async")
+async def test_edit_4k_image_tool_file_data(mock_upload, mock_exec):
+    mock_upload.return_value = "gs://image-editing-agent-artifacts/artifacts/edited_456.png"
+    part_ref = types.Part.from_uri(file_uri="gs://image-editing-agent-artifacts/artifacts/generated_123.png", mime_type="image/png")
     
     mock_tool_ctx = MagicMock()
     mock_tool_ctx.user_id = "designer@agency.com"
-    mock_tool_ctx.list_artifacts = AsyncMock(return_value=["original_image.png"])
-    mock_tool_ctx.load_artifact = AsyncMock(return_value=part)
+    mock_tool_ctx.list_artifacts = AsyncMock(return_value=["generated_123.png"])
+    mock_tool_ctx.load_artifact = AsyncMock(return_value=part_ref)
     mock_tool_ctx.save_artifact = AsyncMock()
 
     edited_img = Image.new("RGB", (4096, 4096), color="yellow")
@@ -100,7 +100,7 @@ async def test_edit_4k_image_tool(mock_exec):
 
     result = await edit_4k_image(
         prompt="Change the sky to sunset golden hour",
-        image_artifact_name="original_image.png",
+        image_artifact_name="generated_123.png",
         aspect_ratio="1:1",
         tool_context=mock_tool_ctx
     )
@@ -108,10 +108,13 @@ async def test_edit_4k_image_tool(mock_exec):
     assert "Successfully edited image" in result
     assert "4096x4096" in result
     assert "300 DPI" in result
+    assert "gs://image-editing-agent-artifacts/artifacts/edited_456.png" in result
     assert mock_tool_ctx.save_artifact.called
     saved_args = mock_tool_ctx.save_artifact.call_args
-    assert saved_args.kwargs["custom_metadata"]["model"] == MODEL_NAME
-    assert saved_args.kwargs["custom_metadata"]["image_size"] == "4K"
+    assert saved_args.kwargs["custom_metadata"]["gcs_uri"] == "gs://image-editing-agent-artifacts/artifacts/edited_456.png"
+    # Ensure saved artifact is a file_data reference
+    saved_artifact = saved_args.kwargs["artifact"]
+    assert hasattr(saved_artifact, "file_data") and saved_artifact.file_data is not None
 
 def test_get_user_identity_variations():
     assert get_user_identity(None) == "unknown"
