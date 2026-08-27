@@ -305,26 +305,27 @@ async def _resolve_source_image_uri(
     if image_artifact_name and image_artifact_name.startswith("gs://"):
         return image_artifact_name, None, "image/png"
 
-    # Case 2: Named artifact in artifacts/ (generated images)
+    # Case 2: Direct or base-name match in artifacts/ (generated images)
     if image_artifact_name and bucket:
         b = bucket.blob(f"artifacts/{image_artifact_name}")
         if b.exists():
             return f"gs://{GCS_BUCKET_NAME}/artifacts/{image_artifact_name}", None, "image/png"
+        if not image_artifact_name.endswith(".png"):
+            b_png = bucket.blob(f"artifacts/{image_artifact_name}.png")
+            if b_png.exists():
+                return f"gs://{GCS_BUCKET_NAME}/artifacts/{image_artifact_name}.png", None, "image/png"
 
-        # Case 3: User uploaded image stored under image_agent/{user_id}/{session_id}/{name}/...
-        if user_id and session_id:
-            b_upload = bucket.blob(f"image_agent/{user_id}/{session_id}/{image_artifact_name}/0")
-            if b_upload.exists():
-                return f"gs://{GCS_BUCKET_NAME}/image_agent/{user_id}/{session_id}/{image_artifact_name}/0", None, "image/png"
+        # Case 3: Search anywhere in GCS bucket by filename or substring (user uploads in GE)
+        base_name = image_artifact_name.split(".")[0]
+        for b_item in bucket.list_blobs(prefix="image_agent/"):
+            if base_name in b_item.name or image_artifact_name in b_item.name:
+                return f"gs://{GCS_BUCKET_NAME}/{b_item.name}", None, "image/png"
 
-        # Case 4: Search anywhere in session prefix for matching name
-        if user_id and session_id:
-            prefix = f"image_agent/{user_id}/{session_id}/"
-            for b_sess in bucket.list_blobs(prefix=prefix):
-                if image_artifact_name in b_sess.name:
-                    return f"gs://{GCS_BUCKET_NAME}/{b_sess.name}", None, "image/png"
+        for b_item in bucket.list_blobs(prefix="artifacts/"):
+            if base_name in b_item.name or image_artifact_name in b_item.name:
+                return f"gs://{GCS_BUCKET_NAME}/{b_item.name}", None, "image/png"
 
-    # Case 5: Use ADK load_artifact if available
+    # Case 4: Use ADK load_artifact if available
     if image_artifact_name and tool_context and hasattr(tool_context, "load_artifact"):
         try:
             part = await tool_context.load_artifact(image_artifact_name)
@@ -338,15 +339,15 @@ async def _resolve_source_image_uri(
         except Exception:
             pass
 
-    # Case 6: If no name or not found yet, check GCS user session for any uploaded files
-    if bucket and user_id and session_id:
-        prefix = f"image_agent/{user_id}/{session_id}/"
+    # Case 5: If no name or not found yet, check GCS user session for any uploaded files
+    if bucket:
+        prefix = f"image_agent/{user_id}/{session_id}/" if (user_id and session_id) else "image_agent/"
         blobs = list(bucket.list_blobs(prefix=prefix))
         if blobs:
             blobs.sort(key=lambda x: x.time_created or 0, reverse=True)
             return f"gs://{GCS_BUCKET_NAME}/{blobs[0].name}", None, "image/png"
 
-    # Case 7: Check recent session events for inline images or file_data
+    # Case 6: Check recent session events for inline images or file_data
     if tool_context and hasattr(tool_context, "session") and tool_context.session:
         events = getattr(tool_context.session, "events", [])
         for evt in reversed(events):
@@ -360,7 +361,7 @@ async def _resolve_source_image_uri(
                         uri = await _upload_to_gcs_async(temp_name, p.inline_data.data, p.inline_data.mime_type or "image/png")
                         return uri, None, p.inline_data.mime_type or "image/png"
 
-    # Case 8: If image_artifact_name was provided, fallback to canonical artifacts/ path
+    # Case 7: If image_artifact_name was provided, fallback to canonical artifacts/ path
     if image_artifact_name:
         return f"gs://{GCS_BUCKET_NAME}/artifacts/{image_artifact_name}", None, "image/png"
 
