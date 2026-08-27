@@ -102,21 +102,19 @@ adk deploy agent_engine image_agent \
 
 ## 🔐 Configuring in Gemini Enterprise
 
-To connect the deployed Agent Runtime agent to **Gemini Enterprise**:
+Note: The values below are for Google OAuth. If using a different OAuth provider, the values will be different.
 
-1. **Authorization Resource (OAuth 2.0)**:
-   - **Authorization URL**:
-     ```text
-     https://accounts.google.com/o/oauth2/v2/auth?response_type=code&access_type=offline&prompt=consent&scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fcloud-platform+openid+email+profile
-     ```
-   - **Token URL**: `https://oauth2.googleapis.com/token`
-   - **Scopes**: `https://www.googleapis.com/auth/cloud-platform openid email profile`
+### Authorization Resource
+- **Authorization Name**: A name of your choosing
+- **Client ID**: Obtained from your OAuth Provider
+- **Client Secret**: Obtained from your OAuth Provider
+- **Token URI**: `https://oauth2.googleapis.com/token`
+- **Authorization URI**: `https://accounts.google.com/o/oauth2/v2/auth?response_type=code&access_type=offline&prompt=consent&scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fcloud-platform+openid+email+profile`
 
-2. **Agent Resource Path**:
-   Provide the full resource name returned from the deployment output:
-   ```text
-   projects/YOUR_PROJECT_ID/locations/us-central1/reasoningEngines/YOUR_REASONING_ENGINE_ID
-   ```
+### Agent Definition
+- **Agent Name**: A name of your choosing
+- **Agent Description**: A description of your choosing
+- **Agent Runtime Reasoning Engine**: `projects/YOUR_PROJECT_ID/locations/YOUR_REGION/reasoningEngines/YOUR_REASONING_ENGINE_ID`
 
 ---
 
