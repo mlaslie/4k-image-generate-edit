@@ -129,3 +129,52 @@ To view the audit logs in GCP Logs Explorer:
 resource.type="aiplatform.googleapis.com/ReasoningEngine"
 logName="projects/YOUR_PROJECT_ID/logs/image_agent_user_audit"
 ```
+
+Each entry records the requesting user, the prompt, and the link to the output image,
+along with correlation and timing fields:
+
+| Field | Description |
+|---|---|
+| `user_id` | The signed-in Gemini Enterprise user making the request |
+| `prompt` | The generation or edit instruction (truncated at 8,000 characters) |
+| `gcs_uri` / `https_url` | The output image |
+| `session_id` / `invocation_id` | Correlates the entry with the stored session and the runtime logs |
+| `duration_ms` | Total time spent in the tool |
+| `model_ms`, `dpi_ms`, `upload_ms`, `resolve_ms` | Per-stage breakdown of that time |
+
+To trace a single turn end to end:
+```sql
+logName="projects/YOUR_PROJECT_ID/logs/image_agent_user_audit"
+jsonPayload.session_id="YOUR_SESSION_ID"
+```
+
+---
+
+## 🩺 Troubleshooting
+
+### A request in the Gemini Enterprise app appears to hang or never returns a result
+
+**Refresh the browser.** The result is usually already there.
+
+4K image generation and editing take roughly 50–70 seconds per turn, during which the
+agent sends nothing on the streaming connection. If that silent gap exceeds the client's
+tolerance, the Gemini Enterprise app stops rendering the response even though the agent
+completed the work normally.
+
+The agent always writes its final answer to the session before finishing, so refreshing
+the conversation re-reads it from session state and the result appears. Nothing is lost,
+and the request does not need to be resubmitted.
+
+To confirm a turn actually completed, check for a matching success entry:
+```sql
+logName="projects/YOUR_PROJECT_ID/logs/image_agent_user_audit"
+jsonPayload.action=("generate_image_success" OR "edit_image_success")
+```
+If the entry is present, the image was generated and uploaded successfully, and
+`https_url` links directly to it.
+
+### The first request after a period of inactivity is dropped
+
+Set `min_instances` to `1` in `.agent_engine_config.json`. With `min_instances: 0` the
+container scales to zero, and a request arriving during the ~90 second cold start can be
+dropped before it ever reaches the agent.

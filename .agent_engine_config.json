@@ -1,4 +1,4 @@
 {
-  "min_instances": 0,
+  "min_instances": 1,
   "max_instances": 100
 }

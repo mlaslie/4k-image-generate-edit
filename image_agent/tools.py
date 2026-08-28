@@ -1,6 +1,6 @@
 import io
 import os
-import gc
+import re
 import time
 import json
 import base64
@@ -19,6 +19,24 @@ MODEL_NAME = "gemini-3-pro-image"
 GCS_BUCKET_NAME = os.environ.get("GCS_ARTIFACT_BUCKET", "image-editing-agent-artifacts")
 GCP_PROJECT = os.environ.get("GOOGLE_CLOUD_PROJECT", "laslie-demo-project")
 
+# Maximum number of characters of a prompt retained in an audit log entry.
+MAX_LOGGED_PROMPT_CHARS = 8000
+
+# GCS path segments are built from caller-supplied identity strings; restrict them
+# to a character set that cannot escape its prefix.
+_UNSAFE_SEGMENT_CHARS = re.compile(r"[^A-Za-z0-9._@+-]")
+
+
+def _safe_segment(value: Optional[str], fallback: str = "unknown") -> str:
+    """Sanitizes an identity string for safe use as a single GCS path segment."""
+    segment = _UNSAFE_SEGMENT_CHARS.sub("_", (value or "").strip()).strip("._")
+    return segment[:128] or fallback
+
+
+def _user_prefix(user_id: Optional[str]) -> str:
+    """Returns the per-user artifact prefix that isolates one caller's images."""
+    return f"artifacts/{_safe_segment(user_id)}/"
+
 # --- Client & Logger Singletons ---
 _gcp_logging_client: Optional[Any] = None
 _gcp_audit_logger: Optional[Any] = None
@@ -33,12 +51,12 @@ def get_logging_client():
     if _logging_init_attempted:
         return _gcp_logging_client, _gcp_audit_logger
 
-    _logging_init_attempted = True
     use_enterprise = (
         os.environ.get("GOOGLE_GENAI_USE_ENTERPRISE", "1") == "1"
         or os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "1") == "1"
     )
     if not use_enterprise:
+        _logging_init_attempted = True
         return None, None
 
     try:
@@ -47,8 +65,11 @@ def get_logging_client():
 
         _gcp_logging_client = google.cloud.logging.Client(project=project)
         _gcp_audit_logger = _gcp_logging_client.logger("image_agent_user_audit")
+        # Only latch once a usable client exists, so a transient ADC/import failure
+        # does not disable audit logging for the life of the instance.
+        _logging_init_attempted = True
     except Exception as e:
-        logger.debug("Cloud Logging initialization bypassed: %s", e)
+        logger.warning("Cloud Logging initialization failed, will retry: %s", e)
     return _gcp_logging_client, _gcp_audit_logger
 
 
@@ -70,68 +91,55 @@ def get_genai_client() -> genai.Client:
     """Initializes and caches a singleton Google GenAI client configured for ADC / Vertex AI."""
     global _genai_client
     if _genai_client is None:
-        api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
         project = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCP_PROJECT", "laslie-demo-project")
         location = os.environ.get("GOOGLE_CLOUD_LOCATION", "global")
-        use_enterprise = (
-            os.environ.get("GOOGLE_GENAI_USE_ENTERPRISE", "1") == "1"
-            or os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "1") == "1"
-        )
-
-        if api_key:
-            _genai_client = genai.Client(api_key=api_key)
-        elif use_enterprise and project:
-            _genai_client = genai.Client(vertexai=True, project=project, location=location)
-        else:
-            _genai_client = genai.Client()
+        # Always authenticate as the Agent Runtime service account via ADC. A stray
+        # GEMINI_API_KEY/GOOGLE_API_KEY in the environment must not silently switch
+        # the client off Vertex AI, which would also drop image_config support.
+        _genai_client = genai.Client(vertexai=True, project=project, location=location)
     return _genai_client
 
 
 def get_user_identity(tool_context: Optional[ToolContext] = None) -> str:
     """
-    Extracts the user identity (email / ID) from Gemini Enterprise OIDC tokens,
-    session state, tool_context.user_id, or metadata.
-    Returns 'unknown' if not resolvable without failing.
+    Extracts the identity of the Gemini Enterprise end user driving this request.
+
+    Under Agent Runtime the signed-in principal arrives as the ADK session's
+    user_id, exposed as `tool_context.user_id`; the remaining lookups are
+    defensive fallbacks. Returns 'unknown' rather than failing the request.
     """
     if not tool_context:
         return "unknown"
 
     try:
-        # 1. Check direct tool_context.user_id property
+        # 1. ToolContext.user_id -> InvocationContext.user_id -> session.user_id
         user_id = getattr(tool_context, "user_id", None)
         if user_id and isinstance(user_id, str) and user_id.strip():
             return user_id.strip()
 
-        # 2. Check session.user_id
-        if hasattr(tool_context, "session") and tool_context.session:
-            session_user_id = getattr(tool_context.session, "user_id", None)
+        # 2. The session object directly, if the context did not surface it
+        session = getattr(tool_context, "session", None)
+        if session is not None:
+            session_user_id = getattr(session, "user_id", None)
             if session_user_id and isinstance(session_user_id, str) and session_user_id.strip():
                 return session_user_id.strip()
 
-        # 3. Check OIDC auth response / token claims
-        if hasattr(tool_context, "get_auth_response"):
-            try:
-                auth_resp = tool_context.get_auth_response()
-                if auth_resp and isinstance(auth_resp, dict):
-                    for key in ["email", "user_email", "preferred_username", "sub"]:
-                        val = auth_resp.get(key)
-                        if val and isinstance(val, str) and val.strip():
-                            return val.strip()
-            except Exception:
-                pass
-
-        # 4. Check session state or invocation state for OIDC / user claims
-        state = getattr(tool_context, "state", {}) or {}
-        if isinstance(state, dict):
+        # 3. Session state, which is a State/Mapping rather than a plain dict
+        state = getattr(tool_context, "state", None)
+        if state is not None:
             for key in ["user_email", "email", "user_id", "user", "preferred_username"]:
-                val = state.get(key)
+                try:
+                    val = state.get(key)
+                except Exception:
+                    val = None
                 if val and isinstance(val, str) and val.strip():
                     return val.strip()
 
-        # 5. Check custom_metadata
-        if hasattr(tool_context, "custom_metadata") and tool_context.custom_metadata:
+        # 4. Invocation custom_metadata
+        custom_metadata = getattr(tool_context, "custom_metadata", None)
+        if custom_metadata:
             for key in ["user_email", "email", "user_id", "user", "principal"]:
-                val = tool_context.custom_metadata.get(key)
+                val = custom_metadata.get(key)
                 if val and isinstance(val, str) and val.strip():
                     return val.strip()
     except Exception:
@@ -157,6 +165,19 @@ def _get_session_id(tool_context: Optional[ToolContext] = None) -> str:
     return ""
 
 
+def _context_ids(tool_context: Optional[ToolContext] = None) -> Dict[str, str]:
+    """
+    Returns the session and invocation identifiers for the current request, so an
+    audit entry can be correlated with the runtime logs and the stored session.
+    """
+    ids = {"session_id": _get_session_id(tool_context)}
+    if tool_context is not None:
+        invocation_id = getattr(tool_context, "invocation_id", None)
+        if invocation_id:
+            ids["invocation_id"] = str(invocation_id)
+    return ids
+
+
 def _write_cloud_log_struct(log_payload: Dict[str, Any]):
     """Helper to write log entry with ReasoningEngine resource attachment in worker thread."""
     try:
@@ -164,19 +185,31 @@ def _write_cloud_log_struct(log_payload: Dict[str, Any]):
         if gcp_logger:
             from google.cloud.logging_v2.resource import Resource
 
-            engine_id = os.environ.get("REASONING_ENGINE_ID", "6477237842635390976")
-            location = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
+            # Agent Runtime injects GOOGLE_CLOUD_AGENT_ENGINE_ID/_LOCATION. Never fall
+            # back to a hardcoded engine id: that would file this agent's audit trail
+            # under a different engine. GOOGLE_CLOUD_LOCATION is the model API region
+            # ("global") and is deliberately not used for the engine resource.
+            engine_id = os.environ.get("GOOGLE_CLOUD_AGENT_ENGINE_ID") or os.environ.get(
+                "REASONING_ENGINE_ID", ""
+            )
+            location = os.environ.get("GOOGLE_CLOUD_AGENT_ENGINE_LOCATION", "")
             project = os.environ.get("GOOGLE_CLOUD_PROJECT", "laslie-demo-project")
 
-            resource = Resource(
-                type="aiplatform.googleapis.com/ReasoningEngine",
-                labels={
-                    "reasoning_engine_id": engine_id,
-                    "location": location,
-                    "resource_container": f"projects/{project}",
-                },
-            )
-            gcp_logger.log_struct(log_payload, resource=resource, severity="INFO")
+            resource = None
+            if engine_id and location:
+                resource = Resource(
+                    type="aiplatform.googleapis.com/ReasoningEngine",
+                    labels={
+                        "reasoning_engine_id": engine_id,
+                        "location": location,
+                        # Bare project identifier, matching the runtime's own entries.
+                        "resource_container": project,
+                    },
+                )
+            if resource is not None:
+                gcp_logger.log_struct(log_payload, resource=resource, severity="INFO")
+            else:
+                gcp_logger.log_struct(log_payload, severity="INFO")
     except Exception as e:
         logger.debug("Cloud Logging struct write exception: %s", e)
 
@@ -188,12 +221,17 @@ def log_user_activity(action: str, user_id: str, details: Dict[str, Any]):
     """
     try:
         safe_user_id = user_id if (user_id and isinstance(user_id, str) and user_id.strip()) else "unknown"
+        safe_details = dict(details)
+        for key in ("prompt", "negative_prompt", "error"):
+            val = safe_details.get(key)
+            if isinstance(val, str) and len(val) > MAX_LOGGED_PROMPT_CHARS:
+                safe_details[key] = val[:MAX_LOGGED_PROMPT_CHARS] + "...[truncated]"
         log_payload = {
             "event": "image_agent_user_activity",
             "action": action,
             "user_id": safe_user_id,
             "timestamp": time.time(),
-            **details,
+            **safe_details,
         }
 
         logger.info(
@@ -259,6 +297,25 @@ async def process_and_apply_dpi(
     return await asyncio.to_thread(_sync_process_and_apply_dpi, image_bytes)
 
 
+def _describe_empty_response(response: Any) -> str:
+    """Summarizes why a response carried no image, for logs and user-facing errors."""
+    details = []
+    prompt_feedback = getattr(response, "prompt_feedback", None)
+    block_reason = getattr(prompt_feedback, "block_reason", None)
+    if block_reason:
+        details.append(f"block_reason={block_reason}")
+    for cand in getattr(response, "candidates", None) or []:
+        finish_reason = getattr(cand, "finish_reason", None)
+        if finish_reason:
+            details.append(f"finish_reason={finish_reason}")
+        content = getattr(cand, "content", None)
+        for part in getattr(content, "parts", None) or []:
+            text = getattr(part, "text", None)
+            if text:
+                details.append(f"text={text[:200]}")
+    return "; ".join(details) or "no reason reported"
+
+
 def _extract_image_bytes(response: Any) -> Optional[bytes]:
     """Helper to extract raw image bytes from a GenerateContent response."""
     if hasattr(response, "candidates") and response.candidates:
@@ -270,18 +327,23 @@ def _extract_image_bytes(response: Any) -> Optional[bytes]:
     return None
 
 
-async def _upload_to_gcs_async(filename: str, data: bytes, mime_type: str) -> str:
-    """Uploads raw image bytes to GCS bucket in worker thread and returns gs:// URI."""
+async def _upload_to_gcs_async(
+    object_path: str, data: bytes, mime_type: str
+) -> str:
+    """
+    Uploads raw image bytes to `object_path` in the artifact bucket and returns the
+    gs:// URI. Raises on failure: callers must not report success, or hand back a
+    download link, for an object that was never written.
+    """
+
     def _sync_upload():
-        try:
-            client = get_storage_client()
-            if client:
-                bucket = client.bucket(GCS_BUCKET_NAME)
-                blob = bucket.blob(f"artifacts/{filename}")
-                blob.upload_from_string(data, content_type=mime_type)
-        except Exception as e:
-            logger.warning("GCS direct upload error: %s", e)
-        return f"gs://{GCS_BUCKET_NAME}/artifacts/{filename}"
+        client = get_storage_client()
+        if client is None:
+            raise RuntimeError("Google Cloud Storage client is unavailable")
+        bucket = client.bucket(GCS_BUCKET_NAME)
+        blob = bucket.blob(object_path)
+        blob.upload_from_string(data, content_type=mime_type)
+        return f"gs://{GCS_BUCKET_NAME}/{object_path}"
 
     return await asyncio.to_thread(_sync_upload)
 
@@ -292,91 +354,108 @@ async def _resolve_source_image_uri(
     tool_context: Optional[ToolContext] = None,
 ) -> Tuple[Optional[str], Optional[bytes], str]:
     """
-    Strictly resolves the source image URI within the CURRENT session or explicit artifact name:
-    1. Direct gs:// URI if explicitly provided
-    2. Check recent turn session events for pasted inline_data or file_data
-    3. User uploaded/pasted photos in CURRENT session (gs://{GCS_BUCKET_NAME}/image_agent/{user_id}/{session_id}/...)
-    4. Explicitly named agent-generated artifact (gs://{GCS_BUCKET_NAME}/artifacts/{image_artifact_name})
-    5. Prior assistant turn generated images in the CURRENT session history
+    Resolves the source image to edit, restricted to images belonging to the calling
+    user. Resolution order:
 
-    STRICT SESSION ISOLATION:
-    If no image exists in the current session, returns (None, None, "image/png") to prevent cross-session leakage.
+    1. An explicitly named artifact under this user's prefix, or a gs:// URI that
+       already lies under that prefix.
+    2. An image the user attached on the current turn (paste or upload).
+    3. The most recent image in a user-authored event of the current session.
+    4. An ADK-managed artifact loaded through the tool context.
+
+    Returns (None, None, "image/png") when the user has no image in scope, so the
+    caller can ask them to supply one rather than guessing at a URI.
     """
-    session_id = _get_session_id(tool_context)
+    prefix = _user_prefix(user_id)
+    safe_user = _safe_segment(user_id)
+    safe_session = _safe_segment(_get_session_id(tool_context), fallback="nosession")
     client = get_storage_client()
     bucket = client.bucket(GCS_BUCKET_NAME) if client else None
 
-    # Priority 1: Direct gs:// URI explicitly passed
-    if image_artifact_name and image_artifact_name.startswith("gs://"):
-        return image_artifact_name, None, "image/png"
+    # Priority 1: an explicitly named source. An absolute gs:// URI is honoured only
+    # when it addresses this user's own prefix, so a crafted prompt cannot reach
+    # another user's images.
+    if image_artifact_name:
+        if image_artifact_name.startswith("gs://"):
+            allowed_root = f"gs://{GCS_BUCKET_NAME}/{prefix}"
+            if image_artifact_name.startswith(allowed_root):
+                return image_artifact_name, None, "image/png"
+            logger.warning("Rejected out-of-scope source image URI for user %s", user_id)
+            return None, None, "image/png"
 
-    # Priority 2: Check current session events for freshly pasted or uploaded image parts
-    if tool_context and hasattr(tool_context, "session") and tool_context.session:
-        events = getattr(tool_context.session, "events", [])
-        for evt in reversed(events):
+        if bucket:
+            # Exact object names only; a substring match would let one artifact name
+            # select a different user's or a different session's image.
+            candidates = [f"{prefix}{image_artifact_name}"]
+            if not image_artifact_name.endswith(".png"):
+                candidates.append(f"{prefix}{image_artifact_name}.png")
+            for candidate in candidates:
+                if bucket.blob(candidate).exists():
+                    return f"gs://{GCS_BUCKET_NAME}/{candidate}", None, "image/png"
+
+    # Priority 2: an image attached by the user on this turn.
+    if tool_context is not None:
+        user_content = getattr(tool_context, "user_content", None)
+        resolved = await _image_from_content(user_content, safe_user, safe_session)
+        if resolved:
+            return resolved
+
+    # Priority 3: the most recent image the user contributed earlier in this session.
+    if tool_context is not None:
+        session = getattr(tool_context, "session", None)
+        for evt in reversed(getattr(session, "events", []) or []):
+            # Only user-authored events: an agent event could carry an image the
+            # user never chose as the edit source.
+            if getattr(evt, "author", None) != "user":
+                continue
             content_obj = getattr(evt, "content", None) or getattr(evt, "message", None)
-            if content_obj and getattr(content_obj, "parts", None):
-                for p in content_obj.parts:
-                    if hasattr(p, "inline_data") and p.inline_data and p.inline_data.data:
-                        temp_name = f"pasted_{int(time.time())}.png"
-                        uri = await _upload_to_gcs_async(
-                            temp_name,
-                            p.inline_data.data,
-                            p.inline_data.mime_type or "image/png",
-                        )
-                        return uri, None, p.inline_data.mime_type or "image/png"
-                    if hasattr(p, "file_data") and p.file_data and p.file_data.file_uri:
-                        return p.file_data.file_uri, None, p.file_data.mime_type or "image/png"
+            resolved = await _image_from_content(content_obj, safe_user, safe_session)
+            if resolved:
+                return resolved
 
-    # Priority 3: Check user-uploaded / pasted images in the CURRENT session in GCS
-    if bucket and user_id and session_id:
-        session_prefix = f"image_agent/{user_id}/{session_id}/"
-        if image_artifact_name:
-            base_name = image_artifact_name.split(".")[0]
-            for b in bucket.list_blobs(prefix=session_prefix):
-                if base_name in b.name or image_artifact_name in b.name:
-                    return f"gs://{GCS_BUCKET_NAME}/{b.name}", None, "image/png"
-
-        # If image_artifact_name is empty or not matched above, check if current session has any uploaded blobs
-        sess_blobs = list(bucket.list_blobs(prefix=session_prefix))
-        if sess_blobs:
-            sess_blobs.sort(key=lambda x: x.time_created or 0, reverse=True)
-            return f"gs://{GCS_BUCKET_NAME}/{sess_blobs[0].name}", None, "image/png"
-
-    # Priority 4: Explicitly named artifact in artifacts/ (generated images)
-    if image_artifact_name and bucket:
-        b = bucket.blob(f"artifacts/{image_artifact_name}")
-        if b.exists():
-            return f"gs://{GCS_BUCKET_NAME}/artifacts/{image_artifact_name}", None, "image/png"
-        if not image_artifact_name.endswith(".png"):
-            b_png = bucket.blob(f"artifacts/{image_artifact_name}.png")
-            if b_png.exists():
-                return f"gs://{GCS_BUCKET_NAME}/artifacts/{image_artifact_name}.png", None, "image/png"
-
-    # Priority 5: ADK load_artifact in CURRENT session context
-    if image_artifact_name and tool_context and hasattr(tool_context, "load_artifact"):
+    # Priority 4: an ADK-managed artifact in the current session.
+    if image_artifact_name and tool_context is not None and hasattr(tool_context, "load_artifact"):
         try:
             part = await tool_context.load_artifact(image_artifact_name)
-            if part:
-                if hasattr(part, "file_data") and part.file_data and part.file_data.file_uri:
-                    return part.file_data.file_uri, None, part.file_data.mime_type or "image/png"
-                if hasattr(part, "inline_data") and part.inline_data and part.inline_data.data:
-                    temp_name = f"user_ref_{int(time.time())}.png"
-                    uri = await _upload_to_gcs_async(
-                        temp_name,
-                        part.inline_data.data,
-                        part.inline_data.mime_type or "image/png",
-                    )
-                    return uri, None, part.inline_data.mime_type or "image/png"
-        except Exception:
-            pass
+            resolved = await _image_from_content(
+                types.Content(parts=[part]) if part else None, safe_user, safe_session
+            )
+            if resolved:
+                return resolved
+        except Exception as e:
+            logger.debug("load_artifact lookup failed for %s: %s", image_artifact_name, e)
 
-    # Priority 6: Fallback to exact image_artifact_name if explicitly provided
-    if image_artifact_name:
-        return f"gs://{GCS_BUCKET_NAME}/artifacts/{image_artifact_name}", None, "image/png"
-
-    # Strict Session Isolation: No image in current session -> return None
+    # Nothing in scope for this user: never invent a URI.
     return None, None, "image/png"
+
+
+async def _image_from_content(
+    content_obj: Any, safe_user: str, safe_session: str
+) -> Optional[Tuple[str, Optional[bytes], str]]:
+    """
+    Returns a (uri, bytes, mime_type) triple for the first image part of `content_obj`,
+    staging inline bytes into this user's own upload prefix. Returns None if there is
+    no image part.
+    """
+    parts = getattr(content_obj, "parts", None) if content_obj else None
+    if not parts:
+        return None
+
+    for p in parts:
+        file_data = getattr(p, "file_data", None)
+        if file_data and getattr(file_data, "file_uri", None):
+            return file_data.file_uri, None, file_data.mime_type or "image/png"
+
+        inline_data = getattr(p, "inline_data", None)
+        if inline_data and getattr(inline_data, "data", None):
+            mime_type = inline_data.mime_type or "image/png"
+            object_path = (
+                f"uploads/{safe_user}/{safe_session}/pasted_{int(time.time() * 1000)}.png"
+            )
+            uri = await _upload_to_gcs_async(object_path, inline_data.data, mime_type)
+            return uri, None, mime_type
+
+    return None
 
 
 async def _execute_gemini_3_pro_image(
@@ -424,6 +503,11 @@ async def _execute_gemini_3_pro_image(
             raw_bytes = _extract_image_bytes(response)
             if raw_bytes:
                 return raw_bytes
+            # The call succeeded but carried no image (typically a safety block).
+            # Retrying will not change that, so surface the model's own reason.
+            raise RuntimeError(
+                f"{MODEL_NAME} returned no image ({_describe_empty_response(response)})"
+            )
         except Exception as e:
             last_err = e
             if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
@@ -459,6 +543,8 @@ async def generate_4k_image(
         A message detailing the generated image, resolution, DPI metadata, clickable download links, and artifact filename.
     """
     user_id = get_user_identity(tool_context)
+    context_ids = _context_ids(tool_context)
+    started = time.monotonic()
     log_user_activity(
         action="generate_image_request",
         user_id=user_id,
@@ -467,33 +553,41 @@ async def generate_4k_image(
             "aspect_ratio": aspect_ratio or "auto",
             "image_size": image_size or "4K",
             "negative_prompt": negative_prompt,
+            **context_ids,
         },
     )
 
     try:
         full_prompt = f"{prompt} (Exclude: {negative_prompt})" if negative_prompt else prompt
+
+        # Stage timings are recorded so slow turns can be attributed to the model
+        # call, the DPI re-encode, or the upload without extra instrumentation.
+        stage_start = time.monotonic()
         raw_bytes = await _execute_gemini_3_pro_image(
             prompt=full_prompt,
             aspect_ratio=aspect_ratio,
             image_size=image_size or "4K",
         )
+        model_ms = int((time.monotonic() - stage_start) * 1000)
 
         # Inject DPI metadata asynchronously in worker thread
+        stage_start = time.monotonic()
         processed_bytes, mime_type, (width, height), (dpi_x, dpi_y) = await process_and_apply_dpi(raw_bytes)
+        dpi_ms = int((time.monotonic() - stage_start) * 1000)
 
         timestamp = int(time.time())
         filename = f"generated_{timestamp}.png"
+        object_path = f"{_user_prefix(user_id)}{filename}"
 
-        # Stream directly to GCS external storage
-        gcs_uri = await _upload_to_gcs_async(filename, processed_bytes, mime_type)
+        # Stream directly to GCS external storage. A failed upload raises, so a
+        # download link is never reported for an object that does not exist.
+        stage_start = time.monotonic()
+        gcs_uri = await _upload_to_gcs_async(object_path, processed_bytes, mime_type)
+        upload_ms = int((time.monotonic() - stage_start) * 1000)
 
         # Direct clickable HTTPS download URL and Console explorer URL
-        https_view_url = f"https://storage.cloud.google.com/{GCS_BUCKET_NAME}/artifacts/{filename}"
-        console_url = f"https://console.cloud.google.com/storage/browser/_details/{GCS_BUCKET_NAME}/artifacts/{filename}?project={GCP_PROJECT}"
-
-        # Free container memory buffers
-        del raw_bytes, processed_bytes
-        gc.collect()
+        https_view_url = f"https://storage.cloud.google.com/{GCS_BUCKET_NAME}/{object_path}"
+        console_url = f"https://console.cloud.google.com/storage/browser/_details/{GCS_BUCKET_NAME}/{object_path}?project={GCP_PROJECT}"
 
         log_user_activity(
             action="generate_image_success",
@@ -507,6 +601,12 @@ async def generate_4k_image(
                 "dpi": f"{dpi_x}x{dpi_y}",
                 "aspect_ratio": aspect_ratio or "auto",
                 "image_size": image_size or "4K",
+                "duration_ms": int((time.monotonic() - started) * 1000),
+                "model_ms": model_ms,
+                "dpi_ms": dpi_ms,
+                "upload_ms": upload_ms,
+                "image_bytes": len(processed_bytes),
+                **context_ids,
             },
         )
 
@@ -527,7 +627,12 @@ async def generate_4k_image(
         log_user_activity(
             action="generate_image_failure",
             user_id=user_id,
-            details={"prompt": prompt, "error": str(e)},
+            details={
+                "prompt": prompt,
+                "error": str(e),
+                "duration_ms": int((time.monotonic() - started) * 1000),
+                **context_ids,
+            },
         )
         return f"Failed to generate image with {MODEL_NAME}: {str(e)}"
 
@@ -556,6 +661,8 @@ async def edit_4k_image(
         A message detailing the edited image, resolution, DPI metadata, clickable download links, and new artifact filename.
     """
     user_id = get_user_identity(tool_context)
+    context_ids = _context_ids(tool_context)
+    started = time.monotonic()
     log_user_activity(
         action="edit_image_request",
         user_id=user_id,
@@ -564,27 +671,38 @@ async def edit_4k_image(
             "image_artifact_name": image_artifact_name,
             "aspect_ratio": aspect_ratio or "auto",
             "image_size": image_size or "4K",
+            **context_ids,
         },
     )
 
     try:
+        # Stage timings are recorded so slow turns can be attributed to source
+        # resolution, the model call, the DPI re-encode, or the upload.
+        stage_start = time.monotonic()
         input_image_uri, input_image_bytes, input_mime_type = await _resolve_source_image_uri(
             image_artifact_name=image_artifact_name,
             user_id=user_id,
             tool_context=tool_context,
         )
+        resolve_ms = int((time.monotonic() - stage_start) * 1000)
 
         if not input_image_uri and not input_image_bytes:
             log_user_activity(
                 action="edit_image_missing_source",
                 user_id=user_id,
-                details={"prompt": prompt, "image_artifact_name": image_artifact_name},
+                details={
+                    "prompt": prompt,
+                    "image_artifact_name": image_artifact_name,
+                    "duration_ms": int((time.monotonic() - started) * 1000),
+                    **context_ids,
+                },
             )
             return (
                 "Error: No image was found in this conversation to edit. "
                 "Please upload or paste an image into the chat, or provide a prompt to generate a new 4K image."
             )
 
+        stage_start = time.monotonic()
         raw_bytes = await _execute_gemini_3_pro_image(
             prompt=prompt,
             input_image_uri=input_image_uri,
@@ -593,23 +711,26 @@ async def edit_4k_image(
             aspect_ratio=aspect_ratio,
             image_size=image_size or "4K",
         )
+        model_ms = int((time.monotonic() - stage_start) * 1000)
 
         # Inject DPI metadata asynchronously in worker thread
+        stage_start = time.monotonic()
         processed_bytes, mime_type, (width, height), (dpi_x, dpi_y) = await process_and_apply_dpi(raw_bytes)
+        dpi_ms = int((time.monotonic() - stage_start) * 1000)
 
         timestamp = int(time.time())
         filename = f"edited_{timestamp}.png"
+        object_path = f"{_user_prefix(user_id)}{filename}"
 
-        # Stream directly to GCS external storage
-        gcs_uri = await _upload_to_gcs_async(filename, processed_bytes, mime_type)
+        # Stream directly to GCS external storage. A failed upload raises, so a
+        # download link is never reported for an object that does not exist.
+        stage_start = time.monotonic()
+        gcs_uri = await _upload_to_gcs_async(object_path, processed_bytes, mime_type)
+        upload_ms = int((time.monotonic() - stage_start) * 1000)
 
         # Direct clickable HTTPS download URL and Console explorer URL
-        https_view_url = f"https://storage.cloud.google.com/{GCS_BUCKET_NAME}/artifacts/{filename}"
-        console_url = f"https://console.cloud.google.com/storage/browser/_details/{GCS_BUCKET_NAME}/artifacts/{filename}?project={GCP_PROJECT}"
-
-        # Explicit garbage collection
-        del raw_bytes, processed_bytes
-        gc.collect()
+        https_view_url = f"https://storage.cloud.google.com/{GCS_BUCKET_NAME}/{object_path}"
+        console_url = f"https://console.cloud.google.com/storage/browser/_details/{GCS_BUCKET_NAME}/{object_path}?project={GCP_PROJECT}"
 
         log_user_activity(
             action="edit_image_success",
@@ -624,6 +745,13 @@ async def edit_4k_image(
                 "dpi": f"{dpi_x}x{dpi_y}",
                 "aspect_ratio": aspect_ratio or "auto",
                 "image_size": image_size or "4K",
+                "duration_ms": int((time.monotonic() - started) * 1000),
+                "resolve_ms": resolve_ms,
+                "model_ms": model_ms,
+                "dpi_ms": dpi_ms,
+                "upload_ms": upload_ms,
+                "image_bytes": len(processed_bytes),
+                **context_ids,
             },
         )
 
@@ -645,6 +773,11 @@ async def edit_4k_image(
         log_user_activity(
             action="edit_image_failure",
             user_id=user_id,
-            details={"prompt": prompt, "error": str(e)},
+            details={
+                "prompt": prompt,
+                "error": str(e),
+                "duration_ms": int((time.monotonic() - started) * 1000),
+                **context_ids,
+            },
         )
         return f"Failed to edit image with {MODEL_NAME}: {str(e)}"

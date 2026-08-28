@@ -1,13 +1,7 @@
-google-adk[a2a,otel-gcp]==2.7.1
-google-genai>=2.19.0
-pillow>=11.0.0
-pydantic>=2.10.0
-google-cloud-aiplatform>=1.140.0
-google-cloud-logging>=3.11.0
-google-cloud-storage>=2.14.0
-opentelemetry-exporter-otlp-proto-http>=1.20.0
-opentelemetry-exporter-gcp-logging>=1.7.0a0
-opentelemetry-exporter-gcp-trace>=1.7.0a0
-opentelemetry-instrumentation-google-genai>=0.7b1
-opentelemetry-instrumentation-httpx>=0.54b0
-opentelemetry-instrumentation-grpc>=0.43b0
+# Runtime dependencies are defined once, in the deployed agent package.
+-r image_agent/requirements.txt
+
+# Local development / test only (not deployed).
+pytest>=8.0.0
+pytest-asyncio>=0.24.0
+anyio>=4.0.0
