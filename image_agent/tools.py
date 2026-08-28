@@ -2,6 +2,7 @@ import io
 import os
 import re
 import time
+import zlib
 import json
 import base64
 import asyncio
@@ -178,6 +179,59 @@ def _context_ids(tool_context: Optional[ToolContext] = None) -> Dict[str, str]:
     return ids
 
 
+def _describe_part(part: Any) -> Optional[str]:
+    """Describes one content part as a compact tag, without recording its bytes."""
+    inline = getattr(part, "inline_data", None)
+    if inline is not None and getattr(inline, "data", None):
+        return f"inline_data:{inline.mime_type or 'unknown'}:{len(inline.data)}B"
+    file_data = getattr(part, "file_data", None)
+    if file_data is not None and getattr(file_data, "file_uri", None):
+        return f"file_data:{file_data.mime_type or 'unknown'}:{file_data.file_uri}"
+    text = getattr(part, "text", None)
+    if text:
+        return f"text:{len(text)}"
+    for attr in ("function_call", "function_response"):
+        value = getattr(part, attr, None)
+        if value is not None:
+            return attr
+    return None
+
+
+def _describe_available_images(tool_context: Optional[ToolContext] = None) -> Dict[str, Any]:
+    """
+    Records which image-bearing parts are actually visible to this tool call.
+
+    Persisted session events do not always match what arrives in the live request,
+    so this reports what the agent can really see at call time. Only part types,
+    MIME types and sizes are recorded, never image bytes.
+    """
+    summary: Dict[str, Any] = {"user_content": [], "recent_events": []}
+    if tool_context is None:
+        return summary
+
+    try:
+        user_content = getattr(tool_context, "user_content", None)
+        for part in (getattr(user_content, "parts", None) or [])[:10]:
+            tag = _describe_part(part)
+            if tag:
+                summary["user_content"].append(tag)
+
+        session = getattr(tool_context, "session", None)
+        for evt in list(reversed(getattr(session, "events", []) or []))[:12]:
+            content_obj = getattr(evt, "content", None) or getattr(evt, "message", None)
+            tags = [
+                tag
+                for tag in (_describe_part(p) for p in (getattr(content_obj, "parts", None) or [])[:10])
+                if tag
+            ]
+            if tags:
+                summary["recent_events"].append(f"{getattr(evt, 'author', '?')}:{','.join(tags)}")
+    except Exception as e:
+        summary["error"] = str(e)[:200]
+
+    return summary
+
+
 def _write_cloud_log_struct(log_payload: Dict[str, Any]):
     """Helper to write log entry with ReasoningEngine resource attachment in worker thread."""
     try:
@@ -269,10 +323,106 @@ def calculate_dpi_for_resolution(width: int, height: int) -> Tuple[int, int]:
         return (72, 72)
 
 
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+
+# tEXt keywords this module owns; existing copies are replaced rather than duplicated.
+_OWNED_TEXT_KEYWORDS = (b"Resolution", b"DPI")
+
+
+def _png_chunk(chunk_type: bytes, data: bytes) -> bytes:
+    """Builds a single PNG chunk: length, type, data, CRC."""
+    return (
+        len(data).to_bytes(4, "big")
+        + chunk_type
+        + data
+        + zlib.crc32(chunk_type + data).to_bytes(4, "big")
+    )
+
+
+def _inject_png_dpi(
+    image_bytes: bytes,
+) -> Optional[Tuple[bytes, Tuple[int, int], Tuple[int, int]]]:
+    """
+    Stamps DPI metadata onto an already-encoded PNG by rewriting its chunk stream.
+
+    Decoding and re-encoding a 4K image in Pillow costs ~12 seconds and produces
+    identical metadata, so the pixel data is copied through untouched and only the
+    pHYs and tEXt chunks are rewritten.
+
+    Returns (png_bytes, (width, height), (dpi_x, dpi_y)), or None if the input is not
+    a PNG this function can safely rewrite, in which case the caller should fall back
+    to the Pillow path.
+    """
+    if not image_bytes.startswith(_PNG_SIGNATURE):
+        return None
+
+    pos = len(_PNG_SIGNATURE)
+    total = len(image_bytes)
+    chunks = []
+    width = height = None
+
+    while pos + 8 <= total:
+        length = int.from_bytes(image_bytes[pos : pos + 4], "big")
+        chunk_type = image_bytes[pos + 4 : pos + 8]
+        data_start = pos + 8
+        data_end = data_start + length
+        chunk_end = data_end + 4
+        if chunk_end > total:
+            return None  # Truncated stream; leave it to Pillow.
+        data = image_bytes[data_start:data_end]
+
+        if chunk_type == b"IHDR":
+            if length < 8:
+                return None
+            width = int.from_bytes(data[0:4], "big")
+            height = int.from_bytes(data[4:8], "big")
+        elif chunk_type == b"pHYs":
+            pos = chunk_end  # Drop: replaced below.
+            continue
+        elif chunk_type == b"tEXt" and data.split(b"\x00", 1)[0] in _OWNED_TEXT_KEYWORDS:
+            pos = chunk_end  # Drop: replaced below.
+            continue
+
+        chunks.append((chunk_type, image_bytes[pos:chunk_end]))
+        pos = chunk_end
+        if chunk_type == b"IEND":
+            break
+
+    if width is None or height is None or not chunks or chunks[0][0] != b"IHDR":
+        return None
+
+    dpi = calculate_dpi_for_resolution(width, height)
+    # PNG stores physical density in pixels per metre; matches Pillow's conversion.
+    ppm_x = int(dpi[0] * 39.3701 + 0.5)
+    ppm_y = int(dpi[1] * 39.3701 + 0.5)
+
+    metadata = [
+        _png_chunk(b"pHYs", ppm_x.to_bytes(4, "big") + ppm_y.to_bytes(4, "big") + b"\x01"),
+        _png_chunk(b"tEXt", b"Resolution\x00" + f"{width}x{height}".encode("latin-1")),
+        _png_chunk(b"tEXt", b"DPI\x00" + str(dpi[0]).encode("latin-1")),
+    ]
+
+    # pHYs and tEXt must precede IDAT; inserting directly after IHDR satisfies that.
+    out = bytearray(_PNG_SIGNATURE)
+    out += chunks[0][1]
+    for chunk in metadata:
+        out += chunk
+    for _, raw in chunks[1:]:
+        out += raw
+
+    return bytes(out), (width, height), dpi
+
+
 def _sync_process_and_apply_dpi(
     image_bytes: bytes,
 ) -> Tuple[bytes, str, Tuple[int, int], Tuple[int, int]]:
     """Synchronous CPU worker for DPI metadata injection."""
+    injected = _inject_png_dpi(image_bytes)
+    if injected is not None:
+        png_bytes, (width, height), dpi = injected
+        return png_bytes, "image/png", (width, height), dpi
+
+    # Fallback for non-PNG model output: decode and re-encode.
     img = Image.open(io.BytesIO(image_bytes))
     width, height = img.size
     dpi = calculate_dpi_for_resolution(width, height)
@@ -520,6 +670,107 @@ async def _execute_gemini_3_pro_image(
     raise last_err if last_err else RuntimeError(f"No image was returned by {MODEL_NAME}.")
 
 
+# Phrases indicating the user is talking about an image that already exists,
+# rather than asking for a new one to be created.
+_EXISTING_IMAGE_REFERENCE = re.compile(
+    r"\b(?:this|that|the)\s+(?:image|photo|picture|pic|screenshot|one)\b"
+    r"|\bmake\s+(?:this|that|it)\b"
+    r"|\bthe\s+original\b"
+    r"|\bupscale\b"
+    r"|\b(?:enhance|resize|convert|render)\s+(?:this|that|it)\b",
+    re.IGNORECASE,
+)
+
+
+def _current_user_text(tool_context: Optional[ToolContext]) -> str:
+    """Returns the text the user sent on this turn."""
+    if tool_context is None:
+        return ""
+    parts = getattr(getattr(tool_context, "user_content", None), "parts", None) or []
+    return " ".join(getattr(p, "text", "") or "" for p in parts)
+
+
+def _has_visible_image(tool_context: Optional[ToolContext]) -> bool:
+    """Whether any image actually reached the agent, on this turn or earlier in the session."""
+    if tool_context is None:
+        return False
+
+    def _parts_have_image(content_obj: Any) -> bool:
+        for part in (getattr(content_obj, "parts", None) or []):
+            inline = getattr(part, "inline_data", None)
+            if inline is not None and getattr(inline, "data", None):
+                return True
+            file_data = getattr(part, "file_data", None)
+            if file_data is not None and getattr(file_data, "file_uri", None):
+                return True
+        return False
+
+    try:
+        if _parts_have_image(getattr(tool_context, "user_content", None)):
+            return True
+        session = getattr(tool_context, "session", None)
+        for evt in reversed(getattr(session, "events", []) or []):
+            content_obj = getattr(evt, "content", None) or getattr(evt, "message", None)
+            if _parts_have_image(content_obj):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def block_generate_without_source(
+    tool: Any, args: Dict[str, Any], tool_context: Optional[ToolContext] = None
+) -> Optional[Dict[str, Any]]:
+    """
+    Stops `generate_4k_image` from standing in for an image the user already has.
+
+    When a user says "make this image 4k", the surrounding conversation often
+    describes the picture well enough for the model to invent a plausible prompt and
+    generate a lookalike, which is never what was asked for. Images produced by
+    another assistant in the conversation do not reach this agent, so the only
+    correct response is to say so and ask for the image.
+
+    Instruction alone did not hold here, so the rule is enforced in code. Returning a
+    dict skips the tool and hands this response back to the model.
+    """
+    try:
+        if getattr(tool, "name", "") != "generate_4k_image":
+            return None
+        if not _EXISTING_IMAGE_REFERENCE.search(_current_user_text(tool_context)):
+            return None
+        if _has_visible_image(tool_context):
+            return None
+
+        user_id = get_user_identity(tool_context)
+        log_user_activity(
+            action="generate_image_blocked_no_source",
+            user_id=user_id,
+            details={
+                "prompt": args.get("prompt", ""),
+                "user_text": _current_user_text(tool_context)[:500],
+                "visible_images": _describe_available_images(tool_context),
+                **_context_ids(tool_context),
+            },
+        )
+
+        return {
+            "result": (
+                "BLOCKED: The user is asking about an image that already exists, so a new "
+                "image must not be generated. No image is accessible to you: nothing was "
+                "attached or pasted on this turn, and images created by other assistants in "
+                "this conversation are not shared with you.\n\n"
+                "If the user means an image YOU created earlier, call edit_4k_image with that "
+                "filename instead. Otherwise tell the user plainly that you cannot see the "
+                "image, and ask them to upload it or paste it directly into the chat so you "
+                "can render it at the requested resolution. Do not describe or recreate the "
+                "image from the conversation text."
+            )
+        }
+    except Exception as e:
+        logger.warning("block_generate_without_source guard error: %s", e)
+        return None
+
+
 async def generate_4k_image(
     prompt: str,
     aspect_ratio: str = "",
@@ -553,6 +804,7 @@ async def generate_4k_image(
             "aspect_ratio": aspect_ratio or "auto",
             "image_size": image_size or "4K",
             "negative_prompt": negative_prompt,
+            "visible_images": _describe_available_images(tool_context),
             **context_ids,
         },
     )
@@ -671,6 +923,7 @@ async def edit_4k_image(
             "image_artifact_name": image_artifact_name,
             "aspect_ratio": aspect_ratio or "auto",
             "image_size": image_size or "4K",
+            "visible_images": _describe_available_images(tool_context),
             **context_ids,
         },
     )

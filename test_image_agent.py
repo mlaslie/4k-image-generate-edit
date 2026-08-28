@@ -255,3 +255,133 @@ async def test_success_audit_entry_carries_correlation_and_timings(monkeypatch):
         assert isinstance(success[field], int), field
     # Total turn time must account for at least the individual stages.
     assert success["duration_ms"] >= success["dpi_ms"]
+
+
+def test_dpi_injection_preserves_pixels_and_metadata():
+    """The fast path must stamp DPI without altering the image."""
+    from image_agent.tools import _sync_process_and_apply_dpi
+
+    img = Image.new("RGB", (3840, 2160), color="navy")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+
+    out, mime, (w, h), dpi = _sync_process_and_apply_dpi(buf.getvalue())
+
+    assert mime == "image/png"
+    assert (w, h) == (3840, 2160)
+    assert dpi == (300, 300)
+
+    reloaded = Image.open(io.BytesIO(out))
+    assert reloaded.size == (3840, 2160)
+    assert round(reloaded.info["dpi"][0]) == 300
+    assert reloaded.info["Resolution"] == "3840x2160"
+    assert reloaded.info["DPI"] == "300"
+    assert list(reloaded.convert("RGB").getdata()) == list(img.getdata())
+
+
+def test_dpi_injection_replaces_existing_chunks():
+    """Re-stamping an already-stamped image must not duplicate metadata chunks."""
+    from image_agent.tools import _sync_process_and_apply_dpi
+
+    img = Image.new("RGB", (2048, 2048), color="olive")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+
+    once, _, _, _ = _sync_process_and_apply_dpi(buf.getvalue())
+    twice, _, _, dpi = _sync_process_and_apply_dpi(once)
+
+    assert dpi == (240, 240)
+    assert twice.count(b"pHYs") == 1
+    assert twice.count(b"Resolution\x00") == 1
+    assert Image.open(io.BytesIO(twice)).info["Resolution"] == "2048x2048"
+
+
+def test_non_png_falls_back_to_pillow():
+    """A non-PNG payload must still be converted and stamped."""
+    from image_agent.tools import _sync_process_and_apply_dpi, _inject_png_dpi
+
+    img = Image.new("RGB", (1200, 800), color="maroon")
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG")
+
+    assert _inject_png_dpi(buf.getvalue()) is None
+
+    out, mime, (w, h), dpi = _sync_process_and_apply_dpi(buf.getvalue())
+    assert mime == "image/png"
+    assert (w, h) == (1200, 800)
+    assert dpi == (150, 150)
+    assert out.startswith(b"\x89PNG\r\n\x1a\n")
+
+
+def _ctx(user_text, image=False, session_events=None):
+    """Builds a tool context whose user_content mirrors what a real turn carries."""
+    parts = []
+    if image:
+        parts.append(types.Part.from_bytes(data=b"\x89PNG\r\n\x1a\nfake", mime_type="image/png"))
+    parts.append(types.Part(text=user_text))
+    ctx = MagicMock()
+    ctx.user_content = types.Content(role="user", parts=parts)
+    ctx.user_id = "guard@agency.com"
+    ctx.session.events = session_events or []
+    return ctx
+
+
+def _tool(name):
+    t = MagicMock()
+    t.name = name
+    return t
+
+
+def test_guard_blocks_generate_when_user_means_an_existing_image(monkeypatch):
+    from image_agent import tools
+
+    monkeypatch.setattr(tools, "log_user_activity", lambda **kw: None)
+    result = tools.block_generate_without_source(
+        _tool("generate_4k_image"), {"prompt": "a poodle next to George Washington"},
+        _ctx("make this image 4k"))
+
+    assert result is not None
+    assert "BLOCKED" in result["result"]
+    assert "paste" in result["result"] and "upload" in result["result"]
+
+
+def test_guard_allows_a_genuine_new_image_request(monkeypatch):
+    from image_agent import tools
+
+    monkeypatch.setattr(tools, "log_user_activity", lambda **kw: None)
+    assert tools.block_generate_without_source(
+        _tool("generate_4k_image"), {"prompt": "a lighthouse"},
+        _ctx("create an image of a lighthouse at sunset")) is None
+
+
+def test_guard_allows_generate_when_an_image_is_actually_present(monkeypatch):
+    """With a real image in hand the tools can do their job; the guard must stay out."""
+    from image_agent import tools
+
+    monkeypatch.setattr(tools, "log_user_activity", lambda **kw: None)
+    assert tools.block_generate_without_source(
+        _tool("generate_4k_image"), {"prompt": "x"},
+        _ctx("make this image 4k", image=True)) is None
+
+
+def test_guard_never_touches_the_edit_tool(monkeypatch):
+    from image_agent import tools
+
+    monkeypatch.setattr(tools, "log_user_activity", lambda **kw: None)
+    assert tools.block_generate_without_source(
+        _tool("edit_4k_image"), {"prompt": "x"}, _ctx("make this image 4k")) is None
+
+
+def test_guard_sees_an_image_pasted_earlier_in_the_session(monkeypatch):
+    """An image from an earlier turn still counts as available."""
+    from image_agent import tools
+
+    monkeypatch.setattr(tools, "log_user_activity", lambda **kw: None)
+    earlier = MagicMock()
+    earlier.content = types.Content(
+        role="user",
+        parts=[types.Part.from_bytes(data=b"\x89PNG\r\n\x1a\nfake", mime_type="image/png")],
+    )
+    assert tools.block_generate_without_source(
+        _tool("generate_4k_image"), {"prompt": "x"},
+        _ctx("make the original 4k", session_events=[earlier])) is None
